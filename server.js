@@ -1,7 +1,26 @@
 import express from "express";
 import crypto from "crypto";
 import fetch from "node-fetch";
+// Helpers for normalizing + hashing customer data
+const crypto = require('crypto');  // Node built-in, no install needed
 
+function sha256(str) {
+  return crypto.createHash('sha256').update(str).digest('hex');
+}
+
+function normalizeEmail(email) {
+  if (!email) return '';
+  return email.trim().toLowerCase();
+}
+
+function normalizePhone(phone) {
+  if (!phone) return '';
+  let digits = phone.replace(/[^\d+]/g, '');
+  if (!digits.startsWith('+')) {
+    digits = '+1' + digits; // assume Canada if no country code
+  }
+  return digits;
+}
 const app = express();
 app.use(express.json({ type: ["application/json", "text/plain"] })); // accept JSON or text
 

@@ -39,8 +39,8 @@ const normalizePhone = (ph) => {
 // ---- mapper: MangoMint webhook -> Meta CAPI Purchase ----
 function mapToMetaEvent(mm, { test_event_code, ip, ua } = {}) {
   const client = mm.client || mm.customer || {};
-  const appt = mm.appointment || mm.booking || {};
-  const sale = mm.sale || mm.payment || {};
+  const appt   = mm.appointment || mm.booking || {};
+  const sale   = mm.sale || mm.payment || {};
 
   const email = client.email;
   const phone = client.phone || client.mobile;
@@ -49,10 +49,9 @@ function mapToMetaEvent(mm, { test_event_code, ip, ua } = {}) {
   const user_data = {};
   if (email) user_data.em = sha256(normalizeEmail(email));
   if (phone) user_data.ph = sha256(normalizePhone(phone));
-  if (ip) user_data.client_ip_address = ip;
-  if (ua) user_data.client_user_agent = ua;
+  if (ip)    user_data.client_ip_address = ip;
+  if (ua)    user_data.client_user_agent = ua;
 
-  // If you capture these on the browser and pipe them through, include them:
   if (mm.fbp) user_data.fbp = mm.fbp;
   if (mm.fbc) user_data.fbc = mm.fbc;
 
@@ -60,7 +59,6 @@ function mapToMetaEvent(mm, { test_event_code, ip, ua } = {}) {
   const value =
     Number(sale.amount ?? appt.price ?? mm.total_amount ?? mm.amount ?? 0) || 0;
 
-  // event_time must be seconds
   const createdAt =
     mm.timestamp || appt.start_time || appt.created_at || sale.created_at || Date.now();
   const event_time = Math.floor(new Date(createdAt).getTime() / 1000);
@@ -79,10 +77,11 @@ function mapToMetaEvent(mm, { test_event_code, ip, ua } = {}) {
     },
   };
 
-  if (test_event_code) event.test_event_code = test_event_code;
+  // ✅ test_event_code goes at the top level, not inside event
+  const body = { data: [event] };
+  if (test_event_code) body.test_event_code = test_event_code;
 
-  // Meta expects { data: [ { ...event } ] }
-  return { data: [event] };
+  return body;
 }
 
 // ---- sender ----

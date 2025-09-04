@@ -134,7 +134,7 @@ app.post("/webhooks/mangomint", async (req, res) => {
     const mm = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
     const test_event_code = req.query.test_event_code || req.body?.test_event_code;
 console.log('test_event_code:', test_event_code);
-    const metaEvent = mapToMetaEvent(mm);
+    const metaEvent = mapToMetaEvent(mm, test_event_code);
     res.status(200).send("ok"); // acknowledge immediately
     await sendToMeta(metaEvent); // send to Meta
   } catch (e) {

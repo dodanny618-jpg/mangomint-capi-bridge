@@ -2,10 +2,11 @@ import express from "express";
 import crypto from "crypto";
 import fetch from "node-fetch";
 // Helpers for normalizing + hashing customer data
-import crypto from 'crypto';  // Node built-in, no install needed
 
 function sha256(str) {
-  return crypto.createHash('sha256').update(str).digest('hex');
+  return globalThis.crypto
+    ? crypto.createHash('sha256').update(str).digest('hex')
+    : require('crypto').createHash('sha256').update(str).digest('hex');
 }
 
 function normalizeEmail(email) {

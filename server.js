@@ -36,38 +36,57 @@ const normalizePhone = (ph) => {
   return x;
 };
 
-// ---- mapper: MangoMint webhook -> Meta CAPI Purchase ----
+// ---- mapper: MangoMint webhook -> Meta CAPI Purchase (ENRICHED) ----
 function mapToMetaEvent(mm, { test_event_code, ip, ua } = {}) {
+  // Likely shapes from MangoMint
   const client = mm.client || mm.customer || {};
   const appt   = mm.appointment || mm.booking || {};
   const sale   = mm.sale || mm.payment || {};
 
+  // Core identifiers
   const email = client.email;
   const phone = client.phone || client.mobile;
 
-  // Hash identifiers (normalized)
-  const user_data = {};
-  if (email) user_data.em = sha256(normalizeEmail(email));
-  if (phone) user_data.ph = sha256(normalizePhone(phone));
-  if (ip)    user_data.client_ip_address = ip;
-  if (ua)    user_data.client_user_agent = ua;
+  // Extra identifiers (common key variants)
+  const fn      = client.first_name || client.firstName || client.given_name;
+  const ln      = client.last_name  || client.lastName  || client.family_name;
+  const city    = client.city;
+  const state   = client.state || client.province || client.region;
+  const country = client.country || "CA";
+  const zip     = client.zip || client.postal_code || client.postalCode || client.postcode;
+  const externalId = client.id || client.customer_id || client.customerId; // optional
 
+  // Build user_data (normalize + SHA256 hash where required)
+  const user_data = {};
+  if (email)   user_data.em = sha256(normalizeEmail(email));
+  if (phone)   user_data.ph = sha256(normalizePhone(phone));
+  if (fn)      user_data.fn = sha256(String(fn).trim().toLowerCase());
+  if (ln)      user_data.ln = sha256(String(ln).trim().toLowerCase());
+  if (city)    user_data.ct = sha256(String(city).trim().toLowerCase());
+  if (state)   user_data.st = sha256(String(state).trim().toLowerCase());
+  if (country) user_data.country = sha256(String(country).trim().toLowerCase());
+  if (zip)     user_data.zp = sha256(String(zip).replace(/\s+/g, "").toLowerCase()); // e.g., H2X1Y4
+  if (externalId) user_data.external_id = sha256(String(externalId)); // optional but boosts match
+
+  // Network/browser matchers
+  if (ip) user_data.client_ip_address = ip;
+  if (ua) user_data.client_user_agent = ua;
+
+  // Click/browser IDs (from your site)
   if (mm.fbp) user_data.fbp = mm.fbp;
   if (mm.fbc) user_data.fbc = mm.fbc;
 
-  // Determine value and timestamp
-  const value =
-    Number(sale.amount ?? appt.price ?? mm.total_amount ?? mm.amount ?? 0) || 0;
-
-  const createdAt =
-    mm.timestamp || appt.start_time || appt.created_at || sale.created_at || Date.now();
+  // Value & timing
+  const value = Number(sale.amount ?? appt.price ?? mm.total_amount ?? mm.amount ?? 0) || 0;
+  const createdAt  = mm.timestamp || appt.start_time || appt.created_at || sale.created_at || Date.now();
   const event_time = Math.floor(new Date(createdAt).getTime() / 1000);
 
+  // Build event
   const event = {
     event_name: "Purchase",
     event_time,
     action_source: "website",
-    event_source_url: EVENT_SOURCE_URL,
+    event_source_url: EVENT_SOURCE_URL, // your domain, not mangomint.com
     event_id: String(mm.id || appt.id || sale.id || Date.now()),
     user_data,
     custom_data: {
@@ -76,6 +95,12 @@ function mapToMetaEvent(mm, { test_event_code, ip, ua } = {}) {
       content_name: appt.service_name || appt.service || "Massage booking",
     },
   };
+
+  // test_event_code must be top-level
+  const body = { data: [event] };
+  if (test_event_code) body.test_event_code = test_event_code;
+  return body;
+}
 
   // ✅ test_event_code goes at the top level, not inside event
   const body = { data: [event] };

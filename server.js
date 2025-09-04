@@ -54,7 +54,7 @@ const normalizePhone = (ph) => {
 };
 
 // Map Mangomint webhook → Meta event
-function mapToMetaEvent(mm) {
+function mapToMetaEvent(mm, test_event_code) {
   const evt = (mm.event || mm.type || "").toLowerCase();
   const client = mm.client || mm.customer || {};
   const appt = mm.appointment || mm.booking || {};
@@ -63,6 +63,22 @@ function mapToMetaEvent(mm) {
   const email = client.email;
   const phone = client.phone || client.mobile;
   const value = Number(sale.amount || appt.price || mm.amount || 0);
+
+  const event = {
+    event_name: "Purchase", // hardcoding purchase for now
+    event_time: Math.floor(Date.now() / 1000), // seconds
+    action_source: "website",
+    user_data: buildUserData({ email, phone }),
+    custom_data: { value, currency: "CAD" }
+  };
+
+  // 👇 Only include if you pass it in from the handler
+  if (test_event_code) {
+    event.test_event_code = test_event_code;
+  }
+
+  return { data: [event] };
+}
 
   let event_name = "Schedule"; // default for appointments
   if (value > 0 && /paid|payment|completed|sale/.test(evt)) event_name = "Purchase";
@@ -116,6 +132,8 @@ app.get("/", (_req, res) => res.send("Mangomint → Meta CAPI bridge OK"));
 app.post("/webhooks/mangomint", async (req, res) => {
   try {
     const mm = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
+    const test_event_code = req.query.test_event_code || req.body?.test_event_code;
+console.log('test_event_code:', test_event_code);
     const metaEvent = mapToMetaEvent(mm);
     res.status(200).send("ok"); // acknowledge immediately
     await sendToMeta(metaEvent); // send to Meta

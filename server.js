@@ -94,18 +94,11 @@ function mapToMetaEvent(mm, { test_event_code, ip, ua } = {}) {
       currency: DEFAULT_CURRENCY,
       content_name: appt.service_name || appt.service || "Massage booking",
     },
-  };
+};
 
   // test_event_code must be top-level
   const body = { data: [event] };
   if (test_event_code) body.test_event_code = test_event_code;
-  return body;
-}
-
-  // ✅ test_event_code goes at the top level, not inside event
-  const body = { data: [event] };
-  if (test_event_code) body.test_event_code = test_event_code;
-
   return body;
 }
 

@@ -2,7 +2,7 @@ import express from "express";
 import crypto from "crypto";
 import fetch from "node-fetch";
 // Helpers for normalizing + hashing customer data
-const crypto = require('crypto');  // Node built-in, no install needed
+import crypto from 'crypto';  // Node built-in, no install needed
 
 function sha256(str) {
   return crypto.createHash('sha256').update(str).digest('hex');

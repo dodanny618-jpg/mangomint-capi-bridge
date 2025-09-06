@@ -1,11 +1,9 @@
 // server.js — Bridge Render (ESM, Express, CORS, /webhooks + /webhooks/mangomint)
 
-// --- Hashing + normalization (for higher EMQ) ---
 import { createHash } from "node:crypto";
 const sha256 = (s = "") =>
   createHash("sha256").update(String(s).trim().toLowerCase()).digest("hex");
 const normalizeEmail = (email) => String(email || "").trim().toLowerCase();
-// Convert to E.164 before hashing (defaults to +1 for 10-digit CA/US)
 const normalizePhone = (ph) => {
   if (!ph) return "";
   let x = String(ph).replace(/[^\d+]/g, "");
@@ -18,12 +16,10 @@ const normalizePhone = (ph) => {
 };
 const normalizeLower = (v) => String(v || "").trim().toLowerCase();
 
-// ---------- Core deps ----------
 import express from "express";
 import cors from "cors";
 import fetch from "node-fetch";
 
-// ---------- App & CORS ----------
 const app = express();
 
 const allowedOrigins = [
@@ -33,12 +29,11 @@ const allowedOrigins = [
 
 const corsOptions = {
   origin(origin, cb) {
-    // Autorise Postman/curl (pas d'Origin) + tes domaines
     if (!origin || allowedOrigins.includes(origin)) return cb(null, true);
     return cb(new Error("Not allowed by CORS"));
   },
   methods: ["POST", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "X-Webhook-Secret"], // allow secret header
+  allowedHeaders: ["Content-Type", "X-Webhook-Secret"],
   optionsSuccessStatus: 204,
 };
 
@@ -46,15 +41,13 @@ app.use(cors(corsOptions));
 app.options("*", cors(corsOptions));
 app.options("/webhooks", cors(corsOptions));
 app.options("/webhooks/mangomint", cors(corsOptions));
-
 app.use(express.json({ limit: "1mb", type: ["application/json", "text/plain"] }));
 
-// ---------- Env ----------
 const {
   PORT = 8080,
-  META_PIXEL_ID,            // ex: 1214969237001592
-  META_ACCESS_TOKEN,        // long Meta token
-  MANGOMINT_WEBHOOK_SECRET, // optional: secure MM webhook
+  META_PIXEL_ID,
+  META_ACCESS_TOKEN,
+  MANGOMINT_WEBHOOK_SECRET,
 } = process.env;
 
 if (!META_PIXEL_ID || !META_ACCESS_TOKEN) {
@@ -64,7 +57,6 @@ if (!META_PIXEL_ID || !META_ACCESS_TOKEN) {
 
 const META_ENDPOINT = `https://graph.facebook.com/v19.0/${META_PIXEL_ID}/events`;
 
-// ---------- Helpers ----------
 const toNumber = (x, d = 0) => {
   const n = Number(x);
   return Number.isFinite(n) ? n : d;
@@ -74,14 +66,11 @@ const clientIp = (req) =>
   req.socket.remoteAddress ||
   "";
 
-// ---------- Health ----------
 app.get("/", (_req, res) => {
   res.send("Mangomint → Meta CAPI bridge OK");
 });
 
-// ===================================================================
-//  Route 1 — /webhooks  (InitiateCheckout depuis le site - FRONT → CAPI)
-// ===================================================================
+// --------------------------- /webhooks ---------------------------
 app.post("/webhooks", async (req, res) => {
   try {
     const {
@@ -90,7 +79,7 @@ app.post("/webhooks", async (req, res) => {
       event_source_url,
       action_source = "website",
       custom_data = { currency: "CAD", value: 0 },
-      test_event_code, // visible en Test Events si présent
+      test_event_code,
     } = typeof req.body === "string" ? JSON.parse(req.body) : req.body || {};
 
     const metaBody = {
@@ -100,7 +89,7 @@ app.post("/webhooks", async (req, res) => {
           event_time: Math.floor(Date.now() / 1000),
           event_source_url: event_source_url || "https://altheatherapie.ca",
           action_source,
-          event_id, // doit matcher le Pixel pour déduplication
+          event_id,
           user_data: {
             client_ip_address: clientIp(req),
             client_user_agent: req.headers["user-agent"] || "unknown",
@@ -128,57 +117,60 @@ app.post("/webhooks", async (req, res) => {
   }
 });
 
-// ===================================================================
-//  Route 2 — /webhooks/mangomint  (Purchase depuis MangoMint - SERVER → CAPI)
-// ===================================================================
-
-// Mapper MangoMint -> Meta Purchase (EMQ boosted: hashed em/ph/fn/ln + fbp/fbc)
+// --------------- mapper MangoMint -> Meta Purchase ---------------
 function mapMangoMintToPurchase(mm, { ip, ua, test_event_code } = {}) {
   const client = mm.client || mm.customer || {};
   const appt   = mm.appointment || mm.booking || {};
   const sale   = mm.sale || mm.payment || mm.order || {};
 
-  // --- fields confirmed by MangoMint for you ---
   const email = client.email;
   const phone = client.phone || client.mobile;
   const first = client.first_name || client.firstName || client.given_name;
   const last  = client.last_name  || client.lastName  || client.family_name;
-  const externalId = client.id || client.customer_id || client.customerId; // optional
+  const externalId = client.id || client.customer_id || client.customerId;
 
-  // Build user_data (minimum + hashed identifiers)
   const user_data = {
     client_ip_address: ip || "",
     client_user_agent: ua || "unknown",
   };
 
-  // Keep browser IDs if you pass them through booking link
   const fbp = mm.fbp || mm.browser_id?.fbp || mm.query?.fbp;
   const fbc = mm.fbc || mm.browser_id?.fbc || mm.query?.fbc;
   if (fbp) user_data.fbp = fbp;
   if (fbc) user_data.fbc = fbc;
 
-  // Hashed IDs (only if present)
   if (email)   user_data.em = sha256(normalizeEmail(email));
   if (phone)   user_data.ph = sha256(normalizePhone(phone));
   if (first)   user_data.fn = sha256(normalizeLower(first));
   if (last)    user_data.ln = sha256(normalizeLower(last));
   if (externalId) user_data.external_id = sha256(String(externalId));
 
-  // Value & context
   const value = toNumber(
     sale.amount ?? sale.total ?? mm.total_amount ?? mm.amount ?? appt.price ?? 0,
     0
   );
   const currency = sale.currency || mm.currency || "CAD";
-
   const contentName =
     appt.service_name || appt.service || sale.item_name || "MangoMint Purchase";
 
-  const createdAt =
-    sale.created_at || sale.timestamp || appt.start_time || mm.timestamp || Date.now();
-  const event_time = Math.floor(new Date(createdAt).getTime() / 1000);
+  // ----- Timestamp safe (never future; max 7 days window) -----
+  let createdAt =
+    sale.created_at ||
+    sale.timestamp ||
+    appt.start_time ||
+    mm.timestamp ||
+    Date.now();
 
-  // Use stable id for dedup (prefer sale.id / appt.id)
+  let ms = new Date(createdAt).getTime();
+  if (!Number.isFinite(ms)) ms = Date.now();
+  let ts = Math.floor(ms / 1000);
+
+  const now = Math.floor(Date.now() / 1000);
+  const sevenDays = 7 * 24 * 60 * 60;
+  if (ts > now) ts = now;                  // pas dans le futur
+  if (ts < now - sevenDays) ts = now;      // pas plus vieux que 7 jours
+  const event_time = ts;
+
   const event_id = String(mm.event_id || sale.id || appt.id || mm.id || Date.now());
 
   const body = {
@@ -190,11 +182,7 @@ function mapMangoMintToPurchase(mm, { ip, ua, test_event_code } = {}) {
         event_source_url: mm.event_source_url || "https://altheatherapie.ca",
         event_id,
         user_data,
-        custom_data: {
-          value,
-          currency,
-          content_name: contentName,
-        },
+        custom_data: { value, currency, content_name: contentName },
       },
     ],
     access_token: META_ACCESS_TOKEN,
@@ -204,9 +192,9 @@ function mapMangoMintToPurchase(mm, { ip, ua, test_event_code } = {}) {
   return body;
 }
 
+// ---------------------- /webhooks/mangomint ----------------------
 app.post("/webhooks/mangomint", async (req, res) => {
   try {
-    // simple optional auth
     if (MANGOMINT_WEBHOOK_SECRET) {
       const got = req.headers["x-webhook-secret"];
       if (got !== MANGOMINT_WEBHOOK_SECRET) {
@@ -215,7 +203,6 @@ app.post("/webhooks/mangomint", async (req, res) => {
     }
 
     const payload = typeof req.body === "string" ? JSON.parse(req.body) : req.body || {};
-
     const test_event_code = payload.test_event_code || req.query.test_event_code;
 
     const ip = clientIp(req);
@@ -235,12 +222,10 @@ app.post("/webhooks/mangomint", async (req, res) => {
     return res.status(200).json({ ok: true, meta: j });
   } catch (err) {
     console.error("MangoMint webhook error:", err);
-    // 200 to avoid aggressive retries; we log the error
     return res.status(200).json({ ok: false, error: String(err) });
   }
 });
 
-// ---------- Start ----------
 app.listen(PORT, () => {
   console.log(`✅ Bridge listening on port ${PORT}`);
 });

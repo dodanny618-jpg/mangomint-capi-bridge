@@ -1,7 +1,11 @@
-// server.js — Render (ESM) : /webhooks (IC) + /webhooks/mangomint (Schedule/Purchase) + CORS + logs
+// server.js — Render (ESM) : /webhooks (IC) + /webhooks/mangomint (Booking→Purchase & Sale→Purchase)
+// CORS • Hashing (EMQ) • Safe time • Retry • Logs
+
+// ---------- Core deps ----------
 import express from "express";
 import cors from "cors";
 import fetch from "node-fetch";
+import { createHash } from "node:crypto";
 
 // ---------- App & CORS ----------
 const app = express();
@@ -13,7 +17,7 @@ const allowedOrigins = [
 
 const corsOptions = {
   origin(origin, cb) {
-    // Autorise Postman/curl (pas d'Origin) + tes domaines
+    // Allow server-to-server (no Origin) + your domains
     if (!origin || allowedOrigins.includes(origin)) return cb(null, true);
     return cb(new Error("Not allowed by CORS"));
   },
@@ -30,8 +34,8 @@ app.use(express.json({ limit: "1mb", type: ["application/json", "text/plain"] })
 const {
   PORT = 8080,
   META_PIXEL_ID,            // ex: 1214969237001592
-  META_ACCESS_TOKEN,        // ton long token Meta
-  MANGOMINT_WEBHOOK_SECRET, // optionnel
+  META_ACCESS_TOKEN,        // long-lived Meta token
+  MANGOMINT_WEBHOOK_SECRET, // optional: simple auth for MangoMint webhook
 } = process.env;
 
 if (!META_PIXEL_ID || !META_ACCESS_TOKEN) {
@@ -41,10 +45,37 @@ if (!META_PIXEL_ID || !META_ACCESS_TOKEN) {
 
 const META_ENDPOINT = `https://graph.facebook.com/v19.0/${META_PIXEL_ID}/events`;
 
-// ---------- Helpers ----------
+// ---------- Helpers: hashing / normalize ----------
+const sha256 = (s = "") =>
+  createHash("sha256").update(String(s).trim().toLowerCase()).digest("hex");
+
+const normEmail = (v) => String(v || "").trim().toLowerCase();
+const normPhone = (v) => {
+  if (!v) return "";
+  let x = String(v).replace(/[^\d+]/g, "");
+  if (!x.startsWith("+")) {
+    if (x.length === 10) x = `+1${x}`;              // CA/US default
+    else if (x.length === 11 && x.startsWith("1")) x = `+${x}`;
+    else x = `+${x}`;
+  }
+  return x;
+};
+const lower = (v) => String(v || "").trim().toLowerCase();
+
+const isSha256 = (v) => typeof v === "string" && /^[a-f0-9]{64}$/.test(v);
+const ensureHashed = (key, raw) => {
+  if (!raw) return undefined;
+  // Meta expects lowercase SHA-256 of normalized values
+  if (isSha256(raw)) return raw;
+  if (key === "em") return sha256(normEmail(raw));
+  if (key === "ph") return sha256(normPhone(raw));
+  return sha256(lower(raw));
+};
+
 const clientIp = (req) =>
   req.headers["x-forwarded-for"]?.split(",")[0]?.trim() ||
-  req.socket.remoteAddress || "";
+  req.socket.remoteAddress ||
+  "";
 
 const toNumber = (x, d = 0) => {
   const n = Number(x);
@@ -55,15 +86,47 @@ const safeEventTime = (ts) => {
   let t = Math.floor(new Date(ts || Date.now()).getTime() / 1000);
   const now = Math.floor(Date.now() / 1000);
   if (!Number.isFinite(t) || t > now) t = now;
+  // (Optional) clamp to last 7 days if you ever pass historical
+  const sevenDaysAgo = now - 7 * 24 * 60 * 60;
+  if (t < sevenDaysAgo) t = now;
   return t;
 };
 
-// ---------- Health ----------
+// ---------- Meta sender with small retry ----------
+async function sendToMeta(body) {
+  const url = `${META_ENDPOINT}`;
+  const payload = JSON.stringify(body);
+  const headers = { "Content-Type": "application/json" };
+
+  let attempt = 0;
+  let lastErr;
+  while (attempt < 3) {
+    attempt++;
+    const res = await fetch(`${url}`, { method: "POST", headers, body: payload });
+    const text = await res.text();
+    let json;
+    try { json = JSON.parse(text); } catch { json = { raw: text }; }
+
+    console.log(`META send attempt ${attempt} status:`, res.status, json);
+
+    if (res.ok) return json;
+
+    // Retry on transient server errors 5xx or rate limiting 4xx specific
+    if (res.status >= 500 || res.status === 429) {
+      await new Promise(r => setTimeout(r, 300 * attempt)); // simple backoff
+      lastErr = new Error(`Meta transient error ${res.status}`);
+      continue;
+    }
+    // For 4xx functional errors, don't retry
+    throw new Error(`Meta error ${res.status}: ${text}`);
+  }
+  throw lastErr || new Error("Meta unknown error");
+}
+
+// ---------- Health & comfort ----------
 app.get("/", (_req, res) => {
   res.status(200).send("Mangomint → Meta CAPI bridge OK");
 });
-
-// (Confort) éviter le “Cannot GET/POST”
 app.get("/webhooks", (_req, res) => {
   res.status(200).send("POST /webhooks is alive (use POST)");
 });
@@ -73,6 +136,8 @@ app.get("/webhooks/mangomint", (_req, res) => {
 
 // ===================================================================
 // Route 1 — /webhooks : InitiateCheckout (front → CAPI)
+//  - Accepts optional user_data { fbp, fbc, em, ph, fn, ln } (raw or hashed)
+//  - We always add ip/ua and ensure hashing if raw
 // ===================================================================
 app.post("/webhooks", async (req, res) => {
   try {
@@ -83,8 +148,20 @@ app.post("/webhooks", async (req, res) => {
       action_source = "website",
       custom_data = { currency: "CAD", value: 0 },
       test_event_code,
-      user_data, // facultatif: { fbp, fbc, em, ph, fn, ln }
+      user_data = {}, // may contain raw or hashed fields
     } = typeof req.body === "string" ? JSON.parse(req.body) : (req.body || {});
+
+    // Build user_data with guaranteed ip/ua and hashed identifiers if present
+    const ud = {
+      client_ip_address: clientIp(req),
+      client_user_agent: req.headers["user-agent"] || "unknown",
+    };
+    if (user_data.fbp) ud.fbp = user_data.fbp;
+    if (user_data.fbc) ud.fbc = user_data.fbc;
+    if (user_data.em) ud.em = ensureHashed("em", user_data.em);
+    if (user_data.ph) ud.ph = ensureHashed("ph", user_data.ph);
+    if (user_data.fn) ud.fn = ensureHashed("fn", user_data.fn);
+    if (user_data.ln) ud.ln = ensureHashed("ln", user_data.ln);
 
     const metaBody = {
       data: [{
@@ -92,25 +169,15 @@ app.post("/webhooks", async (req, res) => {
         event_time: Math.floor(Date.now() / 1000),
         event_source_url: event_source_url || "https://altheatherapie.ca",
         action_source,
-        event_id, // DOIT matcher le Pixel
-        user_data: {
-          client_ip_address: clientIp(req),
-          client_user_agent: req.headers["user-agent"] || "unknown",
-          ...(user_data || {})
-        },
+        event_id, // MUST match Pixel for Both
+        user_data: ud,
         custom_data,
       }],
       access_token: META_ACCESS_TOKEN,
     };
     if (test_event_code) metaBody.test_event_code = test_event_code;
 
-    const r = await fetch(META_ENDPOINT, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(metaBody),
-    });
-    const j = await r.json().catch(()=> ({}));
-    console.log("META /webhooks status:", r.status, j);
+    const j = await sendToMeta(metaBody);
     return res.status(200).json({ ok: true, meta: j });
   } catch (err) {
     console.error("WEBHOOK ERROR (/webhooks):", err);
@@ -119,32 +186,47 @@ app.post("/webhooks", async (req, res) => {
 });
 
 // ===================================================================
-// Route 2 — /webhooks/mangomint : Schedule / Purchase (MangoMint → CAPI)
+// Route 2 — /webhooks/mangomint : Appointment→Purchase & Sale→Purchase
+//  - Appointment Created  → Purchase (value=0, booking intent)  [Option B]
+//  - Sale Completed       → Purchase (value>0, actual payment)
+//  - Adds hashed em/ph/fn/ln when present to boost EMQ
 // ===================================================================
 
-function mapAppointmentToSchedule(mm, { ip, ua, test_event_code } = {}) {
-  const appt = mm.appointment || {};
+function mapAppointmentToPurchase(mm, { ip, ua, test_event_code } = {}) {
+  const appt   = mm.appointment || {};
   const client = appt.clientInfo || appt.onlineBookingClientInfo || {};
-  const serviceName = appt.services?.[0]?.service?.name || "Appointment";
+  const serviceName =
+    appt.services?.[0]?.service?.name ||
+    appt.services?.[0]?.name ||
+    "Appointment";
 
-  const event_id = String(appt.id || Date.now());
-  const event_time = safeEventTime(appt.createdAt);
+  const event_id   = String(appt.id || Date.now());
+  const event_time = safeEventTime(appt.createdAt || appt.dateTime);
+
+  const user_data = {
+    client_ip_address: ip || "",
+    client_user_agent: ua || "unknown",
+  };
+  if (client.email)     user_data.em = sha256(normEmail(client.email));
+  if (client.phone)     user_data.ph = sha256(normPhone(client.phone));
+  if (client.firstName) user_data.fn = sha256(lower(client.firstName));
+  if (client.lastName)  user_data.ln = sha256(lower(client.lastName));
+
+  // If you later pass fbp/fbc via MangoMint payload/query, keep them:
+  if (mm.fbp) user_data.fbp = mm.fbp;
+  if (mm.fbc) user_data.fbc = mm.fbc;
 
   const body = {
     data: [{
-      event_name: "Schedule",
+      event_name: "Purchase",                 // 👈 Option B: treat booking as Purchase
       event_time,
       action_source: "website",
       event_source_url: "https://altheatherapie.ca/book",
       event_id,
-      user_data: {
-        client_ip_address: ip || "",
-        client_user_agent: ua || "unknown",
-        // (optionnel) ajoute ici em/ph/fn/ln hashés si tu les reçois
-      },
+      user_data,
       custom_data: {
         currency: "CAD",
-        value: 0,
+        value: 0,                             // intent only (no charge)
         content_name: serviceName,
       },
     }],
@@ -154,17 +236,32 @@ function mapAppointmentToSchedule(mm, { ip, ua, test_event_code } = {}) {
   return body;
 }
 
-function mapMangoMintToPurchase(mm, { ip, ua, test_event_code } = {}) {
-  const sale = mm.sale || {};
-  const appt = mm.appointment || {};
+function mapSaleToPurchase(mm, { ip, ua, test_event_code } = {}) {
+  const sale   = mm.sale || {};
+  const appt   = mm.appointment || {};
   const client = sale.client || mm.client || {};
 
-  const value = toNumber(sale.total ?? sale.amount ?? 0, 0);
-  const currency = sale.currency || "CAD";
-  const contentName = appt.services?.[0]?.service?.name || "Purchase";
+  const value      = toNumber(sale.total ?? sale.amount ?? 0, 0);
+  const currency   = sale.currency || "CAD";
+  const contentName =
+    appt.services?.[0]?.service?.name ||
+    appt.services?.[0]?.name ||
+    "Purchase";
 
-  const event_id = String(sale.id || appt.id || Date.now());
-  const event_time = safeEventTime(sale.createdAt || sale.closedAt);
+  const event_id   = String(sale.id || appt.id || Date.now());
+  const event_time = safeEventTime(sale.createdAt || sale.closedAt || mm.timeStamp);
+
+  const user_data = {
+    client_ip_address: ip || "",
+    client_user_agent: ua || "unknown",
+  };
+  if (client.email)     user_data.em = sha256(normEmail(client.email));
+  if (client.phone)     user_data.ph = sha256(normPhone(client.phone));
+  if (client.firstName) user_data.fn = sha256(lower(client.firstName));
+  if (client.lastName)  user_data.ln = sha256(lower(client.lastName));
+
+  if (mm.fbp) user_data.fbp = mm.fbp;
+  if (mm.fbc) user_data.fbc = mm.fbc;
 
   const body = {
     data: [{
@@ -173,12 +270,12 @@ function mapMangoMintToPurchase(mm, { ip, ua, test_event_code } = {}) {
       action_source: "website",
       event_source_url: "https://altheatherapie.ca",
       event_id,
-      user_data: {
-        client_ip_address: ip || "",
-        client_user_agent: ua || "unknown",
-        // (optionnel) fbp/fbc si tu les fais remonter
+      user_data,
+      custom_data: {
+        value,
+        currency,
+        content_name: contentName,
       },
-      custom_data: { value, currency, content_name: contentName },
     }],
     access_token: META_ACCESS_TOKEN,
   };
@@ -188,6 +285,7 @@ function mapMangoMintToPurchase(mm, { ip, ua, test_event_code } = {}) {
 
 app.post("/webhooks/mangomint", async (req, res) => {
   try {
+    // Optional simple auth
     if (MANGOMINT_WEBHOOK_SECRET) {
       const got = req.headers["x-webhook-secret"];
       if (got !== MANGOMINT_WEBHOOK_SECRET) {
@@ -195,33 +293,28 @@ app.post("/webhooks/mangomint", async (req, res) => {
       }
     }
 
-    const payload = typeof req.body === "string" ? JSON.parse(req.body) : (req.body || {});
+    const payload =
+      typeof req.body === "string" ? JSON.parse(req.body) : (req.body || {});
     const ip = clientIp(req);
     const ua = req.headers["user-agent"] || "unknown";
     const test_event_code = payload.test_event_code || req.query.test_event_code;
 
-    const hasSale = !!payload.sale;
+    const hasSale        = !!payload.sale;
     const hasAppointment = !!payload.appointment;
 
     const metaBody = hasSale
-      ? mapMangoMintToPurchase(payload, { ip, ua, test_event_code })
+      ? mapSaleToPurchase(payload, { ip, ua, test_event_code })
       : hasAppointment
-      ? mapAppointmentToSchedule(payload, { ip, ua, test_event_code })
+      ? mapAppointmentToPurchase(payload, { ip, ua, test_event_code })
       : null;
 
     if (!metaBody) return res.status(200).json({ ok: false, msg: "Ignored payload" });
 
-    const r = await fetch(META_ENDPOINT, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(metaBody),
-    });
-    const j = await r.json().catch(()=> ({}));
-    console.log("META /webhooks/mangomint status:", r.status, j);
-
+    const j = await sendToMeta(metaBody);
     return res.status(200).json({ ok: true, meta: j });
   } catch (err) {
     console.error("MangoMint webhook error:", err);
+    // Return 200 to avoid aggressive retries from sources, but log error
     return res.status(200).json({ ok: false, error: String(err) });
   }
 });

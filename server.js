@@ -188,7 +188,6 @@ app.post("/webhooks", async (req, res) => {
       event_id,
       event_source_url,
       action_source = "website",
-      custom_data = { currency: DEFAULT_CURRENCY, value: 0 },
       test_event_code,
       user_data = {},
     } = bodyIn;
@@ -222,7 +221,6 @@ app.post("/webhooks", async (req, res) => {
           action_source,
           event_id, // dedup with Pixel
           user_data: ud,
-          custom_data,
         },
       ],
       access_token: META_ACCESS_TOKEN,

@@ -1,11 +1,11 @@
-// server.js — Clean CAPI bridge for MangoMint + Framer IC
-// Features:
-//  - IC cache (eid → attribution) for 6h
-//  - Manual vs Online filter (ignore manual/admin)
-//  - event_id dedup: Purchase uses the same eid from IC
-//  - Strict attribution: only send Purchase if eid or fbp/fbc exist
-//  - Hash PII via SHA-256; normalize phone
-//  - Optional real Sale endpoint
+// server.js — Clean CAPI bridge for MangoMint + Framer IC (optimisé)
+// - IC cache (eid → attribution) 6h
+// - Manual vs Online filter (ignore manual/admin)
+// - event_id dedup (Purchase réutilise le même eid que l'IC)
+// - Attribution stricte (eid ou fbp/fbc requis)
+// - Hash PII (SHA-256), normalise phone
+// - Purchase (Server) formaté comme le Test A (event_time=now) pour visibilité Test Events
+// - Endpoint sale optionnel (désactivé par défaut côté MangoMint)
 
 import express from "express";
 import cors from "cors";
@@ -46,7 +46,6 @@ if (!META_PIXEL_ID || !META_ACCESS_TOKEN) {
   console.error("❌ Missing META_PIXEL_ID or META_ACCESS_TOKEN");
   process.exit(1);
 }
-
 const META_ENDPOINT = `https://graph.facebook.com/v19.0/${META_PIXEL_ID}/events`;
 
 /* ======================= Utils ======================= */
@@ -103,9 +102,8 @@ app.get("/webhooks/mangomint", (_req, res) => res.status(200).send("POST /webhoo
 app.get("/webhooks/sale", (_req, res) => res.status(200).send("POST /webhooks/sale alive"));
 
 /* ======================= IC Cache (eid → attribution) ======================= */
-// In-memory; swap to Redis for production if you prefer persistence.
 const IC_CACHE = new Map();
-const IC_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
+const IC_TTL_MS = 6 * 60 * 60 * 1000; // 6h
 
 function icSet(eid, data) {
   IC_CACHE.set(eid, { ...data, ts: Date.now() });
@@ -117,59 +115,56 @@ function icGet(eid) {
   return v;
 }
 
-/* ======================= Helpers: MangoMint parsing ======================= */
-// Try to pull eid from multiple potential fields.
+/* ======================= Helpers: MangoMint parsing (MAJ) ======================= */
+function extractReferrer(appt = {}) {
+  return (
+    appt?.onlineBookingClientInfo?.referrerUrl ||
+    appt?.referrerUrl ||
+    appt?.notes ||
+    appt?.clientNotes ||
+    ""
+  );
+}
+function extractEidFromString(s) {
+  if (!s) return null;
+  try {
+    const u = new URL(s, "https://dummy/");
+    const p = u.searchParams.get("eid");
+    if (p) return p;
+  } catch {}
+  const m = String(s).match(/(?:^|[?&])eid=([^&\s]+)/);
+  return m ? m[1] : null;
+}
 function getEidFromAppointment(appt = {}) {
-  // Common places: referrerUrl, notes, metadata…
-  const refUrl = appt?.onlineBookingClientInfo?.referrerUrl;
-  const notes = appt?.notes || appt?.clientNotes || "";
-  const metaEid = appt?.metadata?.eid || appt?.meta?.eid || null;
-
-  const tryExtract = (s) => {
-    if (!s) return null;
-    try {
-      // s may be a full URL; try URL parsing first
-      const u = new URL(s, "https://dummy/");
-      const p = u.searchParams.get("eid");
-      if (p) return p;
-    } catch {}
-    // fallback regex
-    const m = String(s).match(/(?:^|[?&])eid=([^&\s]+)/);
-    return m ? m[1] : null;
-  };
-
-  return metaEid || tryExtract(refUrl) || tryExtract(notes) || null;
+  return appt?.metadata?.eid || appt?.meta?.eid || extractEidFromString(extractReferrer(appt));
 }
 
-// Heuristics to detect online vs manual/admin
+// Online vs Manual
 function isOnlineBooking(appt = {}) {
-  // Prefer explicit flag:
-  if (appt.onlineBookingClientInfo) return true;
+  if (appt.onlineBookingClientInfo) return true; // on exige ce flag pour être sûrs
   const src = (appt.source || appt.createdBy?.type || appt.channel || "").toString().toLowerCase();
-  if (src.includes("online") || src.includes("web") || src.includes("portal")) return true;
   if (src.includes("admin") || src.includes("manual") || src.includes("staff")) return false;
-  // Default: treat as NOT online unless clear signal:
-  return false;
+  return false; // par défaut, on NE compte pas sans preuve online
 }
 function isConfirmed(appt = {}) {
   const st = String(appt.status || "").toLowerCase();
   return ["booked", "confirmed", "scheduled"].includes(st);
 }
 
-// Merge IC user_data into purchase user_data
+// Merge IC user_data → purchase
 function buildUserDataFromIC(eid, fallbackUD = {}) {
   const fromIC = eid ? icGet(eid) : null;
   const ud = { ...fallbackUD };
   if (fromIC?.fbp) ud.fbp = fromIC.fbp;
   if (fromIC?.fbc) ud.fbc = fromIC.fbc;
-  if (fromIC?.em)  ud.em  = fromIC.em;
-  if (fromIC?.ph)  ud.ph  = fromIC.ph;
-  if (fromIC?.fn)  ud.fn  = fromIC.fn;
-  if (fromIC?.ln)  ud.ln  = fromIC.ln;
+  if (fromIC?.em && !ud.em) ud.em = fromIC.em;
+  if (fromIC?.ph && !ud.ph) ud.ph = fromIC.ph;
+  if (fromIC?.fn && !ud.fn) ud.fn = fromIC.fn;
+  if (fromIC?.ln && !ud.ln) ud.ln = fromIC.ln;
   return ud;
 }
 
-/* ======================= Route: /webhooks (IC from Framer) ======================= */
+/* ======================= /webhooks (IC depuis Framer) ======================= */
 app.post("/webhooks", async (req, res) => {
   try {
     const bodyIn = typeof req.body === "string" ? JSON.parse(req.body) : (req.body || {});
@@ -194,7 +189,6 @@ app.post("/webhooks", async (req, res) => {
     if (user_data.fn) ud.fn = /^[a-f0-9]{64}$/.test(user_data.fn) ? user_data.fn : sha256(lower(user_data.fn));
     if (user_data.ln) ud.ln = /^[a-f0-9]{64}$/.test(user_data.ln) ? user_data.ln : sha256(lower(user_data.ln));
 
-    // Cache IC attribution for later Purchase linking
     if (event_id) {
       icSet(event_id, { fbp: ud.fbp, fbc: ud.fbc, em: ud.em, ph: ud.ph, fn: ud.fn, ln: ud.ln });
     }
@@ -202,10 +196,10 @@ app.post("/webhooks", async (req, res) => {
     const metaBody = {
       data: [{
         event_name: event_name || "InitiateCheckout",
-        event_time: Math.floor(Date.now() / 1000),
+        event_time: Math.floor(Date.now() / 1000), // now
         event_source_url: event_source_url || EVENT_SOURCE_URL_BOOK,
         action_source,
-        event_id, // dedup with Pixel
+        event_id,
         user_data: ud,
         custom_data,
       }],
@@ -221,7 +215,34 @@ app.post("/webhooks", async (req, res) => {
   }
 });
 
-/* ======================= Route: /webhooks/mangomint (Appointment → Purchase) ======================= */
+/* ========== Formatter Purchase comme le Test A (garantie de visibilité Test Events) ========== */
+function mapAppointmentToPurchase(appt, { user_data, test_event_code } = {}) {
+  const serviceName =
+    appt?.services?.[0]?.service?.name ||
+    appt?.services?.[0]?.name ||
+    "Appointment";
+
+  const body = {
+    data: [{
+      event_name: "Purchase",
+      event_time: Math.floor(Date.now() / 1000), // now → visible en Test Events
+      action_source: "website",
+      event_source_url: EVENT_SOURCE_URL_BOOK,
+      event_id: appt.__eid__ || String(appt.id || Date.now()),
+      user_data,
+      custom_data: {
+        currency: DEFAULT_CURRENCY,
+        value: 0,
+        content_name: serviceName
+      }
+    }],
+    access_token: META_ACCESS_TOKEN
+  };
+  if (test_event_code) body.test_event_code = test_event_code;
+  return body;
+}
+
+/* ======================= /webhooks/mangomint (Appointment → Purchase) ======================= */
 app.post("/webhooks/mangomint", async (req, res) => {
   try {
     if (MANGOMINT_WEBHOOK_SECRET) {
@@ -233,33 +254,26 @@ app.post("/webhooks/mangomint", async (req, res) => {
 
     const payload = typeof req.body === "string" ? JSON.parse(req.body) : (req.body || {});
     const appt = payload.appointment;
+    const test_event_code = payload.test_event_code || req.query.test_event_code;
 
-    // If MangoMint sent a real sale here by mistake, skip (handle in /webhooks/sale)
     if (payload.sale) {
-      console.log("Skipping Sale payload in /webhooks/mangomint; use /webhooks/sale");
-      return res.status(200).json({ ok: true, skipped: "sale" });
+      return res.status(200).json({ ok: true, skipped: "sale_payload_use_/webhooks/sale" });
     }
-
     if (!appt) return res.status(200).json({ ok: false, msg: "Ignored: no appointment" });
 
-    // 1) Only ONLINE bookings (never manual/admin)
+    // 1) Online confirmé uniquement
     if (!isOnlineBooking(appt)) {
       return res.status(200).json({ ok: true, skipped: "manual_booking" });
     }
-
-    // 2) Only CONFIRMED statuses
     if (!isConfirmed(appt)) {
       return res.status(200).json({ ok: true, skipped: "not_confirmed" });
     }
 
-    // 3) Extract eid from appointment context
+    // 2) Attribution & dédup
     const eid = getEidFromAppointment(appt);
-
-    // 4) Build user_data with IC attribution (if any)
     const ua = req.headers["user-agent"] || "unknown";
     const baseUD = { client_ip_address: clientIp(req), client_user_agent: ua };
 
-    // Include PII from appointment for matching (hashed)
     const cli = appt.clientInfo || appt.onlineBookingClientInfo || {};
     if (cli.email) baseUD.em = sha256(normEmail(cli.email));
     if (cli.phone) baseUD.ph = sha256(normPhone(cli.phone));
@@ -268,32 +282,16 @@ app.post("/webhooks/mangomint", async (req, res) => {
 
     const user_data = buildUserDataFromIC(eid, baseUD);
 
-    // 5) Require attribution (eid or fbp/fbc) to count as ad-sourced Purchase
     const hasAttribution = !!(eid || user_data.fbp || user_data.fbc);
     if (!hasAttribution) {
       return res.status(200).json({ ok: true, skipped: "no_attribution" });
     }
 
-    // 6) Build Purchase with value 0 (no payment here)
-    const serviceName =
-      appt.services?.[0]?.service?.name ||
-      appt.services?.[0]?.name ||
-      "Appointment";
+    // 3) Evenement formaté comme le Test A (event_time = now)
+    appt.__eid__ = eid || String(appt.id || Date.now());
+    const body = mapAppointmentToPurchase(appt, { user_data, test_event_code });
 
-    const metaBody = {
-      data: [{
-        event_name: "Purchase", // Treat confirmed online appointment as conversion
-        event_time: safeEventTime(appt.createdAt || appt.dateTime),
-        action_source: "website",
-        event_source_url: EVENT_SOURCE_URL_BOOK,
-        event_id: eid || String(appt.id), // dedup with Pixel IC if eid present
-        user_data,
-        custom_data: { value: 0, currency: DEFAULT_CURRENCY, content_name: serviceName },
-      }],
-      access_token: META_ACCESS_TOKEN,
-    };
-
-    const j = await sendToMeta(metaBody);
+    const j = await sendToMeta(body);
     return res.status(200).json({ ok: true, meta: j });
 
   } catch (err) {
@@ -302,9 +300,7 @@ app.post("/webhooks/mangomint", async (req, res) => {
   }
 });
 
-/* ======================= (Optional) Route: /webhooks/sale (real paid sale) ======================= */
-// Use this if MangoMint can send a "SaleCompleted" payload with amount paid.
-// Only send Purchase with real value here (and dedup with eid if you have it).
+/* ======================= (Optionnel) /webhooks/sale (real paid sale) ======================= */
 app.post("/webhooks/sale", async (req, res) => {
   try {
     if (MANGOMINT_WEBHOOK_SECRET) {
@@ -324,7 +320,6 @@ app.post("/webhooks/sale", async (req, res) => {
     const when = sale.createdAt || sale.dateTime || appt?.createdAt || Date.now();
     const ua = req.headers["user-agent"] || "unknown";
 
-    // Try to link back to IC if we can extract an eid
     const eid = appt ? getEidFromAppointment(appt) : null;
 
     const baseUD = { client_ip_address: clientIp(req), client_user_agent: ua };
@@ -336,7 +331,6 @@ app.post("/webhooks/sale", async (req, res) => {
 
     const user_data = buildUserDataFromIC(eid, baseUD);
 
-    // Require attribution for ad optimization
     if (!(eid || user_data.fbp || user_data.fbc)) {
       return res.status(200).json({ ok: true, skipped: "no_attribution" });
     }
@@ -349,11 +343,7 @@ app.post("/webhooks/sale", async (req, res) => {
         event_source_url: EVENT_SOURCE_URL_BOOK,
         event_id: eid || String(sale.id || sale.invoiceId || Date.now()),
         user_data,
-        custom_data: {
-          value: amount,
-          currency: DEFAULT_CURRENCY,
-          content_name: "SaleCompleted",
-        },
+        custom_data: { value: amount, currency: DEFAULT_CURRENCY, content_name: "SaleCompleted" },
       }],
       access_token: META_ACCESS_TOKEN,
     };

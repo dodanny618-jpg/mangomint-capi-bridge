@@ -1,18 +1,18 @@
-// server.js — CAPI bridge MangoMint + Framer IC (final + logging)
+// server.js — CAPI bridge MangoMint + Framer IC (final merged)
 // - IC cache (eid → attribution) 6h
-// - Filtre Manual/Admin (ignore)
-// - Dédup: Purchase réutilise l’eid de l’IC
+// - Manual/Admin filters
+// - Dedup: Purchase réutilise l’eid de l’IC + cache 24h
 // - Attribution stricte (exige eid ou fbp/fbc)
 // - Hash PII (SHA-256), normalise phone
-// - event_time=now pour visibilité dans Test Events
-// - Valeur d’achat configurable par env (DEFAULT_PURCHASE_VALUE), sinon 0
-// - Logs détaillés activables via DEBUG_LOGS=1
+// - IC: aucun price/currency (évite warnings Meta)
+// - Purchase: DEFAULT_APPT_VALUE (ENV, défaut 100 CAD) + contents
+// - Logs activables: DEBUG_LOGS=1
 // - Endpoints debug: /debug/ic-cache, /debug/ping
 
 import express from "express";
 import cors from "cors";
 import fetch from "node-fetch";
-import { createHash } from "node:crypto";
+import { createHash, timingSafeEqual } from "node:crypto";
 
 const app = express();
 
@@ -47,7 +47,7 @@ const {
   MANGOMINT_WEBHOOK_SECRET,
   DEFAULT_CURRENCY = "CAD",
   EVENT_SOURCE_URL_BOOK = "https://altheatherapie.ca/en/book",
-  DEFAULT_PURCHASE_VALUE, // facultatif (ex: "100")
+  DEFAULT_APPT_VALUE = "100", // override via Render if needed (e.g. 110)
 } = process.env;
 
 if (!META_PIXEL_ID || !META_ACCESS_TOKEN) {
@@ -55,6 +55,7 @@ if (!META_PIXEL_ID || !META_ACCESS_TOKEN) {
   process.exit(1);
 }
 const META_ENDPOINT = `https://graph.facebook.com/v19.0/${META_PIXEL_ID}/events`;
+const APPT_VALUE_NUM = Number(DEFAULT_APPT_VALUE) || 100;
 
 /* ======================= Utils ======================= */
 const clientIp = (req) =>
@@ -93,8 +94,7 @@ async function sendToMeta(body) {
   for (let attempt = 1; attempt <= 3; attempt++) {
     const res = await fetch(META_ENDPOINT, { method: "POST", headers, body: payload });
     const text = await res.text();
-    let json;
-    try { json = JSON.parse(text); } catch { json = { raw: text }; }
+    let json; try { json = JSON.parse(text); } catch { json = { raw: text }; }
     log(`META attempt ${attempt} →`, res.status, json);
     if (res.ok) return json;
     if (res.status >= 500 || res.status === 429) {
@@ -109,20 +109,14 @@ async function sendToMeta(body) {
 /* ======================= Health ======================= */
 app.get("/", (_req, res) => res.status(200).send("Mangomint → Meta CAPI OK"));
 app.get("/webhooks", (_req, res) => res.status(200).send("POST /webhooks alive"));
-app.get("/webhooks/mangomint", (_req, res) =>
-  res.status(200).send("POST /webhooks/mangomint alive")
-);
+app.get("/webhooks/mangomint", (_req, res) => res.status(200).send("POST /webhooks/mangomint alive"));
 app.get("/webhooks/sale", (_req, res) => res.status(200).send("POST /webhooks/sale alive"));
 app.get("/debug/ping", (_req, res) => res.status(200).json({ ok: true, now: ts() }));
 
 /* ======================= IC Cache (eid → attribution) ======================= */
 const IC_CACHE = new Map();
 const IC_TTL_MS = 6 * 60 * 60 * 1000; // 6h
-
-function icSet(eid, data) {
-  IC_CACHE.set(eid, { ...data, ts: Date.now() });
-  log("IC_CACHE set", eid, Object.keys(data));
-}
+function icSet(eid, data) { IC_CACHE.set(eid, { ...data, ts: Date.now() }); log("IC_CACHE set", eid, Object.keys(data)); }
 function icGet(eid) {
   const v = IC_CACHE.get(eid);
   if (!v) return null;
@@ -135,7 +129,18 @@ app.get("/debug/ic-cache", (_req, res) => {
   res.status(200).json({ size: out.length, items: out.slice(0, 50) });
 });
 
-/* ======================= MangoMint helpers ======================= */
+/* ======================= De-dup cache (24h) ======================= */
+const SENT_CACHE = new Map(); // event_id → ts
+const SENT_TTL_MS = 24 * 60 * 60 * 1000;
+function alreadySent(eventId) {
+  const v = eventId && SENT_CACHE.get(eventId);
+  if (!v) return false;
+  if (Date.now() - v > SENT_TTL_MS) { SENT_CACHE.delete(eventId); return false; }
+  return true;
+}
+function markSent(eventId) { if (eventId) SENT_CACHE.set(eventId, Date.now()); }
+
+/* ======================= Helpers: MangoMint parsing ======================= */
 function extractReferrer(appt = {}) {
   return (
     appt?.onlineBookingClientInfo?.referrerUrl ||
@@ -166,6 +171,7 @@ function isOnlineBooking(appt = {}) {
 }
 function isConfirmed(appt = {}) {
   const st = String(appt.status || "").toLowerCase();
+  if (["canceled","cancelled","declined","no_show","no-show","noshow"].includes(st)) return false;
   return ["booked", "confirmed", "scheduled"].includes(st);
 }
 function buildUserDataFromIC(eid, fallbackUD = {}) {
@@ -185,15 +191,7 @@ app.post("/webhooks", async (req, res) => {
   log("HIT /webhooks (IC) ip=", clientIp(req), "ua=", req.headers["user-agent"] || "?");
   try {
     const bodyIn = typeof req.body === "string" ? JSON.parse(req.body) : req.body || {};
-    const {
-      event_name,
-      event_id,
-      event_source_url,
-      action_source = "website",
-      custom_data = { currency: DEFAULT_CURRENCY, value: 0 },
-      test_event_code,
-      user_data = {},
-    } = bodyIn;
+    const { event_name, event_id, event_source_url, action_source = "website", test_event_code, user_data = {} } = bodyIn;
 
     const ud = {
       client_ip_address: clientIp(req),
@@ -211,12 +209,12 @@ app.post("/webhooks", async (req, res) => {
     const metaBody = {
       data: [{
         event_name: event_name || "InitiateCheckout",
-        event_time: Math.floor(Date.now() / 1000), // now
+        event_time: Math.floor(Date.now() / 1000),
         event_source_url: event_source_url || EVENT_SOURCE_URL_BOOK,
         action_source,
-        event_id, // dedup with Pixel
+        event_id,
         user_data: ud,
-        custom_data,
+        // Pas de custom_data ici → évite les warnings “fixed value/currency”
       }],
       access_token: META_ACCESS_TOKEN,
     };
@@ -231,29 +229,36 @@ app.post("/webhooks", async (req, res) => {
   }
 });
 
-/* ========== Purchase formatter (like Test A) ========== */
+/* ======================= Build Purchase payload ======================= */
 function mapAppointmentToPurchase(appt, { user_data, test_event_code } = {}) {
-  const serviceName =
-    appt?.services?.[0]?.service?.name || appt?.services?.[0]?.name || "Appointment";
+  const serviceName = appt?.services?.[0]?.service?.name || appt?.services?.[0]?.name || "Appointment";
 
-  // Valeur par défaut configurable sinon 0
-  const valueNum = Number(DEFAULT_PURCHASE_VALUE);
-  const value = Number.isFinite(valueNum) ? valueNum : 0;
+  const contents = [{
+    id: `service:${serviceName}`,
+    quantity: 1,
+    item_price: APPT_VALUE_NUM,
+  }];
 
   const srcUrl =
     extractReferrer(appt) && extractReferrer(appt).startsWith("http")
       ? extractReferrer(appt)
-      : undefined;
+      : EVENT_SOURCE_URL_BOOK;
 
   const body = {
     data: [{
       event_name: "Purchase",
-      event_time: Math.floor(Date.now() / 1000), // now → visible in Test Events
+      event_time: Math.floor(Date.now() / 1000), // now → visible dans Test Events
       action_source: "website",
-      event_source_url: srcUrl || appt.event_source_url || EVENT_SOURCE_URL_BOOK,
+      event_source_url: srcUrl,
       event_id: appt.__eid__ || String(appt.id || Date.now()),
       user_data,
-      custom_data: { currency: DEFAULT_CURRENCY, value, content_name: serviceName },
+      custom_data: {
+        currency: DEFAULT_CURRENCY,
+        value: APPT_VALUE_NUM,
+        content_type: "product",
+        contents,
+        content_name: serviceName,
+      },
     }],
     access_token: META_ACCESS_TOKEN,
   };
@@ -266,9 +271,10 @@ app.post("/webhooks/mangomint", async (req, res) => {
   log("HIT /webhooks/mangomint ip=", clientIp(req));
   try {
     if (MANGOMINT_WEBHOOK_SECRET) {
-      const got = req.headers["x-webhook-secret"];
-      if (got !== MANGOMINT_WEBHOOK_SECRET) {
-        log("SKIP → invalid secret");
+      const got = req.headers["x-webhook-secret"] || req.headers["X-Webhook-Secret"];
+      const a = Buffer.from(String(got || ""), "utf8");
+      const b = Buffer.from(String(MANGOMINT_WEBHOOK_SECRET), "utf8");
+      if (a.length !== b.length || !timingSafeEqual(a, b)) {
         return res.status(401).json({ ok: false, error: "Invalid webhook secret" });
       }
     }
@@ -277,46 +283,35 @@ app.post("/webhooks/mangomint", async (req, res) => {
     const appt = payload.appointment;
     const test_event_code = payload.test_event_code || req.query.test_event_code;
 
-    if (payload.sale) {
-      log("SKIP → sale payload in /mangomint (use /webhooks/sale)");
-      return res.status(200).json({ ok: true, skipped: "sale_payload_use_/webhooks/sale" });
-    }
-    if (!appt) {
-      log("SKIP → no appointment");
-      return res.status(200).json({ ok: false, msg: "Ignored: no appointment" });
-    }
-
-    if (!isOnlineBooking(appt)) {
-      log("SKIP → manual/admin booking");
-      return res.status(200).json({ ok: true, skipped: "manual_booking" });
-    }
-    if (!isConfirmed(appt)) {
-      log("SKIP → not confirmed status:", appt.status);
-      return res.status(200).json({ ok: true, skipped: "not_confirmed" });
-    }
+    if (payload.sale) return res.status(200).json({ ok: true, skipped: "sale_payload_use_/webhooks/sale" });
+    if (!appt)       return res.status(200).json({ ok: false, msg: "Ignored: no appointment" });
+    if (!isOnlineBooking(appt)) return res.status(200).json({ ok: true, skipped: "manual_booking" });
+    if (!isConfirmed(appt))     return res.status(200).json({ ok: true, skipped: "not_confirmed" });
 
     const eid = getEidFromAppointment(appt);
     const ua = req.headers["user-agent"] || "unknown";
     const baseUD = { client_ip_address: clientIp(req), client_user_agent: ua };
 
     const cli = appt.clientInfo || appt.onlineBookingClientInfo || {};
-    if (cli.email) baseUD.em = sha256(normEmail(cli.email));
-    if (cli.phone) baseUD.ph = sha256(normPhone(cli.phone));
+    if (cli.email)     baseUD.em = sha256(normEmail(cli.email));
+    if (cli.phone)     baseUD.ph = sha256(normPhone(cli.phone));
     if (cli.firstName) baseUD.fn = sha256(lower(cli.firstName));
-    if (cli.lastName) baseUD.ln = sha256(lower(cli.lastName));
+    if (cli.lastName)  baseUD.ln = sha256(lower(cli.lastName));
 
     const user_data = buildUserDataFromIC(eid, baseUD);
     const hasAttribution = !!(eid || user_data.fbp || user_data.fbc);
-    if (!hasAttribution) {
-      log("SKIP → no attribution (no eid/fbp/fbc)");
-      return res.status(200).json({ ok: true, skipped: "no_attribution" });
-    }
+    if (!hasAttribution) return res.status(200).json({ ok: true, skipped: "no_attribution" });
 
     appt.__eid__ = eid || String(appt.id || Date.now());
-    const body = mapAppointmentToPurchase(appt, { user_data, test_event_code });
+    if (alreadySent(appt.__eid__)) {
+      log("Dedup: Purchase already sent for", appt.__eid__);
+      return res.status(200).json({ ok: true, skipped: "duplicate_event" });
+    }
 
-    log("SEND → Meta Purchase", { event_id: appt.__eid__, eid_present: !!eid, has_fbp: !!user_data.fbp, has_fbc: !!user_data.fbc });
+    const body = mapAppointmentToPurchase(appt, { user_data, test_event_code });
+    log("SEND → Meta Purchase", { event_id: appt.__eid__, has_fbp: !!user_data.fbp, has_fbc: !!user_data.fbc });
     const j = await sendToMeta(body);
+    markSent(appt.__eid__);
     return res.status(200).json({ ok: true, meta: j });
   } catch (err) {
     console.error("MangoMint webhook error:", err);
@@ -324,14 +319,15 @@ app.post("/webhooks/mangomint", async (req, res) => {
   }
 });
 
-/* ======================= (Optional) /webhooks/sale (real paid sale) ======================= */
+/* ======================= /webhooks/sale (real paid sale) ======================= */
 app.post("/webhooks/sale", async (req, res) => {
   log("HIT /webhooks/sale ip=", clientIp(req));
   try {
     if (MANGOMINT_WEBHOOK_SECRET) {
-      const got = req.headers["x-webhook-secret"];
-      if (got !== MANGOMINT_WEBHOOK_SECRET) {
-        log("SKIP → invalid secret (sale)");
+      const got = req.headers["x-webhook-secret"] || req.headers["X-Webhook-Secret"];
+      const a = Buffer.from(String(got || ""), "utf8");
+      const b = Buffer.from(String(MANGOMINT_WEBHOOK_SECRET), "utf8");
+      if (a.length !== b.length || !timingSafeEqual(a, b)) {
         return res.status(401).json({ ok: false, error: "Invalid webhook secret" });
       }
     }
@@ -340,10 +336,7 @@ app.post("/webhooks/sale", async (req, res) => {
     const sale = payload.sale;
     const appt = payload.appointment;
 
-    if (!sale) {
-      log("SKIP → no sale object");
-      return res.status(200).json({ ok: false, msg: "Ignored: no sale" });
-    }
+    if (!sale) return res.status(200).json({ ok: false, msg: "Ignored: no sale" });
 
     const amount = Number(sale.total || sale.amount || 0) || 0;
     const when = sale.createdAt || sale.dateTime || appt?.createdAt || Date.now();
@@ -352,10 +345,10 @@ app.post("/webhooks/sale", async (req, res) => {
 
     const baseUD = { client_ip_address: clientIp(req), client_user_agent: ua };
     const cli = appt?.clientInfo || appt?.onlineBookingClientInfo || sale?.client || {};
-    if (cli.email) baseUD.em = sha256(normEmail(cli.email));
-    if (cli.phone) baseUD.ph = sha256(normPhone(cli.phone));
+    if (cli.email)     baseUD.em = sha256(normEmail(cli.email));
+    if (cli.phone)     baseUD.ph = sha256(normPhone(cli.phone));
     if (cli.firstName) baseUD.fn = sha256(lower(cli.firstName));
-    if (cli.lastName) baseUD.ln = sha256(lower(cli.lastName));
+    if (cli.lastName)  baseUD.ln = sha256(lower(cli.lastName));
 
     const user_data = buildUserDataFromIC(eid, baseUD);
     if (!(eid || user_data.fbp || user_data.fbc)) {
@@ -386,4 +379,4 @@ app.post("/webhooks/sale", async (req, res) => {
 });
 
 /* ======================= Start ======================= */
-app.listen(PORT, () => console.log(`✅ CAPI bridge listening on ${PORT} (DEBUG_LOGS=${DEBUG ? "1" : "0"})`));
+app.listen(PORT, () => console.log(`✅ CAPI bridge listening on ${PORT} (value=${APPT_VALUE_NUM} ${DEFAULT_CURRENCY})`));

@@ -1,13 +1,16 @@
-// server.js — CAPI bridge MangoMint + Framer IC (final merged)
-// - IC cache (eid → attribution) 6h
-// - Manual/Admin filters
-// - Dedup: Purchase réutilise l’eid de l’IC + cache 24h
-// - Attribution stricte (exige eid ou fbp/fbc)
-// - Hash PII (SHA-256), normalise phone
-// - IC: aucun price/currency (évite warnings Meta)
-// - Purchase: DEFAULT_APPT_VALUE (ENV, défaut 100 CAD) + contents
-// - Logs activables: DEBUG_LOGS=1
-// - Endpoints debug: /debug/ic-cache, /debug/ping
+// server.js — CAPI bridge MangoMint + Framer IC (final, prod-safe)
+// - IC (click Book Now) → Pixel+ CAPI dédupliqué via event_id (depuis Framer)
+// - Purchase (RDV en ligne confirmé via MangoMint webhook) → CAPI
+// - Pas de custom_data sur IC (évite les warnings Meta "fixed value/currency")
+// - Purchase: value = DEFAULT_APPT_VALUE (CAD) + contents
+// - Attribution stricte: exige eid (depuis IC) OU fbp/fbc (côté client) pour compter
+// - Filtre manual/admin et statuts non confirmés
+// - Cache IC (eid→user_data) 6h + dédup Purchase 24h
+// - Secret de webhook: header X-Webhook-Secret **ou** query ?key=…
+// - ENV compatibles Render: DEFAULT_APPT_VALUE, DEFAULT_CURRENCY, EVENT_SOURCE_URL,
+//   META_ACCESS_TOKEN, META_PIXEL_ID, MM_WEBHOOK_KEY (ou MANGOMINT_WEBHOOK_SECRET),
+//   PORT, DEBUG_LOGS
+// - Debug routes: /debug/ping, /debug/ic-cache
 
 import express from "express";
 import cors from "cors";
@@ -44,11 +47,20 @@ const {
   PORT = 10000,
   META_PIXEL_ID,
   META_ACCESS_TOKEN,
-  MANGOMINT_WEBHOOK_SECRET,
-  DEFAULT_CURRENCY = "CAD",
-  EVENT_SOURCE_URL_BOOK = "https://altheatherapie.ca/en/book",
-  DEFAULT_APPT_VALUE = "100", // override via Render if needed (e.g. 110)
+  DEFAULT_CURRENCY = process.env.DEFAULT_CURRENCY || "CAD",
+  // Supporte les deux noms que tu utilises déjà:
+  // EVENT_SOURCE_URL (screenshot Render) ou EVENT_SOURCE_URL_BOOK (ancien)
+  EVENT_SOURCE_URL: ENV_EVENT_URL,
+  EVENT_SOURCE_URL_BOOK: ENV_EVENT_URL_BOOK,
+  DEFAULT_APPT_VALUE = "100", // e.g. 110
 } = process.env;
+
+const EVENT_SOURCE_URL_BOOK =
+  ENV_EVENT_URL || ENV_EVENT_URL_BOOK || "https://altheatherapie.ca/en/book";
+
+// Secret: prend MM_WEBHOOK_KEY (ton screenshot) ou MANGOMINT_WEBHOOK_SECRET
+const WEBHOOK_SECRET =
+  process.env.MM_WEBHOOK_KEY || process.env.MANGOMINT_WEBHOOK_SECRET || "";
 
 if (!META_PIXEL_ID || !META_ACCESS_TOKEN) {
   console.error("❌ Missing META_PIXEL_ID or META_ACCESS_TOKEN");
@@ -60,8 +72,7 @@ const APPT_VALUE_NUM = Number(DEFAULT_APPT_VALUE) || 100;
 /* ======================= Utils ======================= */
 const clientIp = (req) =>
   req.headers["x-forwarded-for"]?.split(",")[0]?.trim() ||
-  req.socket.remoteAddress ||
-  "";
+  req.socket.remoteAddress || "";
 
 const safeEventTime = (tsIn) => {
   let t = Math.floor(new Date(tsIn || Date.now()).getTime() / 1000);
@@ -146,8 +157,7 @@ function extractReferrer(appt = {}) {
     appt?.onlineBookingClientInfo?.referrerUrl ||
     appt?.referrerUrl ||
     appt?.notes ||
-    appt?.clientNotes ||
-    ""
+    appt?.clientNotes || ""
   );
 }
 function extractEidFromString(s) {
@@ -164,7 +174,7 @@ function getEidFromAppointment(appt = {}) {
   return appt?.metadata?.eid || appt?.meta?.eid || extractEidFromString(extractReferrer(appt));
 }
 function isOnlineBooking(appt = {}) {
-  if (appt.onlineBookingClientInfo) return true; // signal clair online
+  if (appt.onlineBookingClientInfo) return true; // signal clair
   const src = (appt.source || appt.createdBy?.type || appt.channel || "").toString().toLowerCase();
   if (src.includes("admin") || src.includes("manual") || src.includes("staff")) return false;
   return false; // par défaut: ne pas compter sans preuve online
@@ -214,7 +224,7 @@ app.post("/webhooks", async (req, res) => {
         action_source,
         event_id,
         user_data: ud,
-        // Pas de custom_data ici → évite les warnings “fixed value/currency”
+        // pas de custom_data ici → évite les warnings “fixed value/currency”
       }],
       access_token: META_ACCESS_TOKEN,
     };
@@ -247,7 +257,7 @@ function mapAppointmentToPurchase(appt, { user_data, test_event_code } = {}) {
   const body = {
     data: [{
       event_name: "Purchase",
-      event_time: Math.floor(Date.now() / 1000), // now → visible dans Test Events
+      event_time: Math.floor(Date.now() / 1000), // visible dans Test Events
       action_source: "website",
       event_source_url: srcUrl,
       event_id: appt.__eid__ || String(appt.id || Date.now()),
@@ -270,11 +280,22 @@ function mapAppointmentToPurchase(appt, { user_data, test_event_code } = {}) {
 app.post("/webhooks/mangomint", async (req, res) => {
   log("HIT /webhooks/mangomint ip=", clientIp(req));
   try {
-    if (MANGOMINT_WEBHOOK_SECRET) {
-      const got = req.headers["x-webhook-secret"] || req.headers["X-Webhook-Secret"];
-      const a = Buffer.from(String(got || ""), "utf8");
-      const b = Buffer.from(String(MANGOMINT_WEBHOOK_SECRET), "utf8");
-      if (a.length !== b.length || !timingSafeEqual(a, b)) {
+    // Secret hybride: header OU query (?key=)
+    if (WEBHOOK_SECRET) {
+      const gotHeader = req.headers["x-webhook-secret"] || req.headers["X-Webhook-Secret"];
+      const gotQuery = req.query.key || req.query.secret;
+      let ok = false;
+
+      if (gotHeader) {
+        const a = Buffer.from(String(gotHeader), "utf8");
+        const b = Buffer.from(String(WEBHOOK_SECRET), "utf8");
+        ok = a.length === b.length && timingSafeEqual(a, b);
+      } else if (gotQuery) {
+        ok = String(gotQuery) === String(WEBHOOK_SECRET);
+      }
+
+      if (!ok) {
+        log("SKIP → invalid secret (header/query mismatch)");
         return res.status(401).json({ ok: false, error: "Invalid webhook secret" });
       }
     }
@@ -323,11 +344,21 @@ app.post("/webhooks/mangomint", async (req, res) => {
 app.post("/webhooks/sale", async (req, res) => {
   log("HIT /webhooks/sale ip=", clientIp(req));
   try {
-    if (MANGOMINT_WEBHOOK_SECRET) {
-      const got = req.headers["x-webhook-secret"] || req.headers["X-Webhook-Secret"];
-      const a = Buffer.from(String(got || ""), "utf8");
-      const b = Buffer.from(String(MANGOMINT_WEBHOOK_SECRET), "utf8");
-      if (a.length !== b.length || !timingSafeEqual(a, b)) {
+    if (WEBHOOK_SECRET) {
+      const gotHeader = req.headers["x-webhook-secret"] || req.headers["X-Webhook-Secret"];
+      const gotQuery = req.query.key || req.query.secret;
+      let ok = false;
+
+      if (gotHeader) {
+        const a = Buffer.from(String(gotHeader), "utf8");
+        const b = Buffer.from(String(WEBHOOK_SECRET), "utf8");
+        ok = a.length === b.length && timingSafeEqual(a, b);
+      } else if (gotQuery) {
+        ok = String(gotQuery) === String(WEBHOOK_SECRET);
+      }
+
+      if (!ok) {
+        log("SKIP → invalid secret (sale)");
         return res.status(401).json({ ok: false, error: "Invalid webhook secret" });
       }
     }
@@ -379,4 +410,6 @@ app.post("/webhooks/sale", async (req, res) => {
 });
 
 /* ======================= Start ======================= */
-app.listen(PORT, () => console.log(`✅ CAPI bridge listening on ${PORT} (value=${APPT_VALUE_NUM} ${DEFAULT_CURRENCY})`));
+app.listen(PORT, () =>
+  console.log(`✅ CAPI bridge listening on ${PORT} (value=${APPT_VALUE_NUM} ${DEFAULT_CURRENCY}, DEBUG_LOGS=${DEBUG ? "1":"0"})`)
+);

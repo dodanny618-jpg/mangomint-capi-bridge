@@ -285,7 +285,7 @@ app.post("/webhooks/mangomint", async (req, res) => {
       const gotHeader = req.headers["x-webhook-secret"] || req.headers["X-Webhook-Secret"];
       const gotQuery = req.query.key || req.query.secret;
       let ok = false;
-
+  
       if (gotHeader) {
         const a = Buffer.from(String(gotHeader), "utf8");
         const b = Buffer.from(String(WEBHOOK_SECRET), "utf8");
@@ -303,7 +303,19 @@ app.post("/webhooks/mangomint", async (req, res) => {
     const payload = typeof req.body === "string" ? JSON.parse(req.body) : req.body || {};
     const appt = payload.appointment;
     const test_event_code = payload.test_event_code || req.query.test_event_code;
-
+    // ===== DIAG START =====
+    log("DIAG.appt?           =", !!appt);
+    log("DIAG.status          =", appt?.status);
+    log("DIAG.hasOnlineInfo   =", !!appt?.onlineBookingClientInfo);
+    log("DIAG.referrer        =", extractReferrer(appt || {}));
+    log("DIAG.eidFromAppt     =", getEidFromAppointment(appt || {}));
+    log("DIAG.client.hasPII   =", {
+      email: !!(appt?.clientInfo?.email || appt?.onlineBookingClientInfo?.email),
+      phone: !!(appt?.clientInfo?.phone || appt?.onlineBookingClientInfo?.phone),
+      first: !!(appt?.clientInfo?.firstName || appt?.onlineBookingClientInfo?.firstName),
+      last:  !!(appt?.clientInfo?.lastName  || appt?.onlineBookingClientInfo?.lastName),
+    });
+    // ===== DIAG END =====
     if (payload.sale) return res.status(200).json({ ok: true, skipped: "sale_payload_use_/webhooks/sale" });
     if (!appt)       return res.status(200).json({ ok: false, msg: "Ignored: no appointment" });
     if (!isOnlineBooking(appt)) return res.status(200).json({ ok: true, skipped: "manual_booking" });

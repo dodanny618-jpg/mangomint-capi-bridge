@@ -1,0 +1,17 @@
+{
+  "appointment": {
+    "id": "appt-qa-001",
+    "status": "booked",
+    "onlineBookingClientInfo": {
+      "referrerUrl": "https://altheatherapie.ca/en/book?eid=ic-qa-001-a1b2"
+    },
+    "clientInfo": {
+      "email": "qa1@example.com",
+      "phone": "514-555-0101",
+      "firstName": "Alex",
+      "lastName": "Martin"
+    },
+    "services": [ { "service": { "name": "Massage 60 min" } } ]
+  },
+  "test_event_code": "TEST65403"
+}

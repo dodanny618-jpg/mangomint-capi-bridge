@@ -1,11 +1,9 @@
-// server.js — CAPI bridge MangoMint + Framer IC (online-only purchase, strict attribution)
-// - Purchase si et seulement si: RDV créé EN LIGNE (onlineBookingClientInfo présent)
-// - PAS de filtre de statut (peu importe booked/pending/unconfirmed)
-// - Attribution stricte : exige eid (depuis IC) OU fbp/fbc → “vient de ta landing / vidéo”
-// - Ignore manuel/admin
-// - IC (depuis Framer) : Pixel+CAPI dédupliqué via event_id → remplit cache IC 6h
-// - Dédup Purchase 24h (event_id = eid ou id RDV)
-// - Secret webhook optionnel: header X-Webhook-Secret OU query ?key=…
+// server.js — CAPI bridge MangoMint + Framer IC (strict ad-only Purchases)
+// - IC (click Book Now) → Pixel+CAPI (dédup via event_id), pas de custom_data
+// - Purchase envoyé UNIQUEMENT si: online booking + attribution pub (eid OU fbp/fbc)
+// - Filtre manual/admin, et ignore statuts annulés (pas besoin de “confirmed”)
+// - Cache IC (eid→user_data) 6h + dédup Purchases 24h
+// - Secret de webhook: header X-Webhook-Secret OU query ?key=... (optionnel)
 // - ENV (Render): META_PIXEL_ID, META_ACCESS_TOKEN, DEFAULT_APPT_VALUE, DEFAULT_CURRENCY,
 //                 EVENT_SOURCE_URL (ou EVENT_SOURCE_URL_BOOK), MM_WEBHOOK_KEY (ou MANGOMINT_WEBHOOK_SECRET),
 //                 PORT, DEBUG_LOGS
@@ -54,7 +52,6 @@ const {
 const EVENT_SOURCE_URL_BOOK =
   ENV_EVENT_URL || ENV_EVENT_URL_BOOK || "https://altheatherapie.ca/en/book";
 
-// Secret: MM_WEBHOOK_KEY (préféré) ou MANGOMINT_WEBHOOK_SECRET, sinon vide
 const WEBHOOK_SECRET =
   process.env.MM_WEBHOOK_KEY || process.env.MANGOMINT_WEBHOOK_SECRET || "";
 
@@ -170,10 +167,14 @@ function getEidFromAppointment(appt = {}) {
   return appt?.metadata?.eid || appt?.meta?.eid || extractEidFromString(extractReferrer(appt));
 }
 function isOnlineBooking(appt = {}) {
-  if (appt.onlineBookingClientInfo) return true; // signal clair en ligne
+  if (appt.onlineBookingClientInfo) return true; // signal clair online
   const src = (appt.source || appt.createdBy?.type || appt.channel || "").toString().toLowerCase();
   if (src.includes("admin") || src.includes("manual") || src.includes("staff")) return false;
   return false; // par défaut: ne pas compter sans preuve online
+}
+function isNotCancelled(appt = {}) {
+  const st = String(appt.status || "").toLowerCase();
+  return !["canceled","cancelled","declined","no_show","no-show","noshow"].includes(st);
 }
 function buildUserDataFromIC(eid, fallbackUD = {}) {
   const fromIC = eid ? icGet(eid) : null;
@@ -240,10 +241,8 @@ function mapAppointmentToPurchase(appt, { user_data, test_event_code } = {}) {
     item_price: APPT_VALUE_NUM,
   }];
 
-  const srcUrl =
-    extractReferrer(appt) && extractReferrer(appt).startsWith("http")
-      ? extractReferrer(appt)
-      : EVENT_SOURCE_URL_BOOK;
+  const src = extractReferrer(appt);
+  const srcUrl = src && src.startsWith("http") ? src : EVENT_SOURCE_URL_BOOK;
 
   const body = {
     data: [{
@@ -295,17 +294,19 @@ app.post("/webhooks/mangomint", async (req, res) => {
     const appt = payload.appointment;
     const test_event_code = payload.test_event_code || req.query.test_event_code;
 
-    // DIAG light (désactivable via DEBUG_LOGS=0)
-    log("DIAG.appt?           =", !!appt);
-    log("DIAG.hasOnlineInfo   =", !!appt?.onlineBookingClientInfo);
-    log("DIAG.referrer        =", extractReferrer(appt || {}));
-    log("DIAG.eidFromAppt     =", getEidFromAppointment(appt || {}));
+    // --- Diagnostics utiles (laisse si DEBUG_LOGS=1) ---
+    log("DIAG.appt?         =", !!appt);
+    log("DIAG.status        =", appt?.status);
+    log("DIAG.hasOnlineInfo =", !!appt?.onlineBookingClientInfo);
+    log("DIAG.referrer      =", extractReferrer(appt || {}));
+    log("DIAG.eidFromAppt   =", getEidFromAppointment(appt || {}));
 
-    // 1) Doit être créé EN LIGNE
-    if (!appt)       return res.status(200).json({ ok: false, msg: "Ignored: no appointment" });
+    // 1) On ne traite que les bookings en ligne, non annulés :
+    if (!appt)                  return res.status(200).json({ ok: false, msg: "Ignored: no appointment" });
     if (!isOnlineBooking(appt)) return res.status(200).json({ ok: true, skipped: "manual_booking" });
+    if (!isNotCancelled(appt))  return res.status(200).json({ ok: true, skipped: "cancelled_status" });
 
-    // 2) Attribution stricte (depuis video/landing)
+    // 2) Attribution stricte: doit provenir d’une pub (eid OU fbp/fbc retrouvés via IC)
     const eid = getEidFromAppointment(appt);
     const ua = req.headers["user-agent"] || "unknown";
     const baseUD = { client_ip_address: clientIp(req), client_user_agent: ua };
@@ -318,16 +319,19 @@ app.post("/webhooks/mangomint", async (req, res) => {
 
     const user_data = buildUserDataFromIC(eid, baseUD);
     const hasAttribution = !!(eid || user_data.fbp || user_data.fbc);
-    if (!hasAttribution) return res.status(200).json({ ok: true, skipped: "no_attribution" });
+    if (!hasAttribution) {
+      log("SKIP → no attribution (not from Meta ad)");
+      return res.status(200).json({ ok: true, skipped: "no_attribution" });
+    }
 
-    // 3) Dédup 24h par eid (ou id RDV)
+    // 3) Dédup per eid/appointment id (24h)
     appt.__eid__ = eid || String(appt.id || Date.now());
     if (alreadySent(appt.__eid__)) {
       log("Dedup: Purchase already sent for", appt.__eid__);
       return res.status(200).json({ ok: true, skipped: "duplicate_event" });
     }
 
-    // 4) Envoi Purchase
+    // 4) Envoi du Purchase
     const body = mapAppointmentToPurchase(appt, { user_data, test_event_code });
     log("SEND → Meta Purchase", { event_id: appt.__eid__, has_fbp: !!user_data.fbp, has_fbc: !!user_data.fbc });
     const j = await sendToMeta(body);
@@ -340,15 +344,69 @@ app.post("/webhooks/mangomint", async (req, res) => {
 });
 
 /* ======================= /webhooks/sale (real paid sale) ======================= */
-// ⚠️ Dans ton besoin actuel, on N’UTILISE PAS cette route en production.
-// Elle est gardée pour plus tard si tu passes à du “paiement en ligne” réel.
-// Aujourd’hui, un paiement au TERMINAL NE DOIT PAS envoyer de Purchase.
+// On garde l’endpoint pour le futur (paiement en ligne). Tel que configuré, vous ne l’utilisez pas.
 app.post("/webhooks/sale", async (req, res) => {
   log("HIT /webhooks/sale ip=", clientIp(req));
   try {
-    // On la laisse protégée, mais tu peux ne jamais l’appeler côté MangoMint.
+    if (WEBHOOK_SECRET) {
+      const gotHeader = req.headers["x-webhook-secret"] || req.headers["X-Webhook-Secret"];
+      const gotQuery = req.query.key || req.query.secret;
+      let ok = false;
+
+      if (gotHeader) {
+        const a = Buffer.from(String(gotHeader), "utf8");
+        const b = Buffer.from(String(WEBHOOK_SECRET), "utf8");
+        ok = a.length === b.length && timingSafeEqual(a, b);
+      } else if (gotQuery) {
+        ok = String(gotQuery) === String(WEBHOOK_SECRET);
+      }
+
+      if (!ok) {
+        log("SKIP → invalid secret (sale)");
+        return res.status(401).json({ ok: false, error: "Invalid webhook secret" });
+      }
+    }
+
     const payload = typeof req.body === "string" ? JSON.parse(req.body) : req.body || {};
-    return res.status(200).json({ ok: true, skipped: "sale_endpoint_disabled_for_now" });
+    const sale = payload.sale;
+    const appt = payload.appointment;
+
+    if (!sale) return res.status(200).json({ ok: false, msg: "Ignored: no sale" });
+
+    const amount = Number(sale.total || sale.amount || 0) || 0;
+    const when = sale.createdAt || sale.dateTime || appt?.createdAt || Date.now();
+    const ua = req.headers["user-agent"] || "unknown";
+    const eid = appt ? getEidFromAppointment(appt) : null;
+
+    const baseUD = { client_ip_address: clientIp(req), client_user_agent: ua };
+    const cli = appt?.clientInfo || appt?.onlineBookingClientInfo || sale?.client || {};
+    if (cli.email)     baseUD.em = sha256(normEmail(cli.email));
+    if (cli.phone)     baseUD.ph = sha256(normPhone(cli.phone));
+    if (cli.firstName) baseUD.fn = sha256(lower(cli.firstName));
+    if (cli.lastName)  baseUD.ln = sha256(lower(cli.lastName));
+
+    const user_data = buildUserDataFromIC(eid, baseUD);
+    if (!(eid || user_data.fbp || user_data.fbc)) {
+      log("SKIP → no attribution (sale)");
+      return res.status(200).json({ ok: true, skipped: "no_attribution" });
+    }
+
+    const metaBody = {
+      data: [{
+        event_name: "Purchase",
+        event_time: safeEventTime(when),
+        action_source: "website",
+        event_source_url: EVENT_SOURCE_URL_BOOK,
+        event_id: eid || String(sale.id || sale.invoiceId || Date.now()),
+        user_data,
+        custom_data: { value: amount, currency: DEFAULT_CURRENCY, content_name: "SaleCompleted" },
+      }],
+      access_token: META_ACCESS_TOKEN,
+    };
+
+    log("SEND → Meta Real Sale Purchase", { event_id: metaBody.data[0].event_id, amount });
+    const j = await sendToMeta(metaBody);
+    return res.status(200).json({ ok: true, meta: j });
   } catch (err) {
     console.error("SALE webhook error:", err);
     return res.status(200).json({ ok: false, error: String(err) });

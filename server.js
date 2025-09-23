@@ -256,7 +256,7 @@ function mapAppointmentToPurchase(appt, { user_data, event_id, test_event_code }
   const body = {
     data: [{
       event_name: "Purchase",
-      event_time: Math.floor(Date.now() / 1000), // now → visible in Test Events
+      event_time: safeEventTime(appt?.createdAt || Date.now()),
       action_source: "website",
       event_source_url: srcUrl,
       event_id,

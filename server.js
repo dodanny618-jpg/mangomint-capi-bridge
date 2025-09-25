@@ -1,4 +1,4 @@
-// server.js — MangoMint ↔ Meta CAPI bridge (with PII fallback + external_id)
+// server.js — MangoMint ↔ Meta CAPI bridge (with PII fallback + external_id hashed)
 // - IC (click "Book Now") → Pixel+CAPI; cache IC (eid, fbp/fbc, PII-hash) 24h
 // - Purchase sent ONLY for online bookings (onlineBookingClientInfo OR createdBy.name includes "Online Booking")
 //   • prefer eid from referrer/metadata (if ever present in future); else fallback by matching hashed email/phone to IC cache (≤24h)
@@ -49,10 +49,10 @@ const {
   DEFAULT_APPT_VALUE = "100",
 } = process.env;
 
+// ✅ Fixed URL typo
 const EVENT_SOURCE_URL_BOOK =
-  ENV_EVENT_URL || ENV_EVENT_URL_BOOK || "https://altheatherie.ca/en/book"; // <- keep your intended URL
+  ENV_EVENT_URL || ENV_EVENT_URL_BOOK || "https://altheatherapie.ca/en/book";
 
-// Secret can be provided as MM_WEBHOOK_KEY or MANGOMINT_WEBHOOK_SECRET
 const WEBHOOK_SECRET =
   process.env.MM_WEBHOOK_KEY || process.env.MANGOMINT_WEBHOOK_SECRET || "";
 
@@ -120,7 +120,7 @@ app.get("/debug/ping", (_req, res) => res.status(200).json({ ok: true, now: ts()
 
 /* ============ IC Cache (eid → attribution) ============ */
 const IC_CACHE = new Map(); // key: eid → { fbp,fbc,em,ph,fn,ln, ts }
-const IC_TTL_MS = 24 * 60 * 60 * 1000; // ↑ 24h (was 6h)
+const IC_TTL_MS = 24 * 60 * 60 * 1000; // 24h
 
 function icSet(eid, data) {
   IC_CACHE.set(eid, { ...data, ts: Date.now() });
@@ -133,7 +133,6 @@ function icGet(eid) {
   return v;
 }
 function icFindByPII({ em, ph }) {
-  // em / ph are expected to be SHA-256 hashes here
   const now = Date.now();
   for (const [eid, v] of IC_CACHE.entries()) {
     if (now - v.ts > IC_TTL_MS) continue;
@@ -162,7 +161,7 @@ function alreadySent(eventId) {
 }
 function markSent(eventId) { if (eventId) SENT_CACHE.set(eventId, Date.now()); }
 
-/* ============ (NEW) Idempotency on appointment.id ============ */
+/* ============ Idempotency on appointment.id ============ */
 const APPT_SENT = new Map(); // apptId -> ts
 const APPT_TTL_MS = 24 * 60 * 60 * 1000;
 function apptAlreadySent(id) {
@@ -183,7 +182,7 @@ app.get("/debug/appt-cache", (_req, res) => {
 /* ============ Helpers: MangoMint parsing ============ */
 function extractReferrer(appt = {}) {
   return (
-    appt?.onlineBookingClientInfo?.referrerUrl || // if ever available later
+    appt?.onlineBookingClientInfo?.referrerUrl ||
     appt?.referrerUrl ||
     appt?.notes ||
     appt?.clientNotes || ""
@@ -202,13 +201,16 @@ function extractEidFromString(s) {
 function getEidFromAppointment(appt = {}) {
   return appt?.metadata?.eid || appt?.meta?.eid || extractEidFromString(extractReferrer(appt));
 }
+
+// ✅ Slightly more permissive but safe
 function isOnlineBooking(appt = {}) {
-  if (appt?.onlineBookingClientInfo) return true; // clear online signal
+  if (appt?.onlineBookingClientInfo) return true;
   const createdByName = (appt?.createdBy?.name || "").toLowerCase();
   if (createdByName.includes("online booking")) return true;
   const src = (appt?.source || appt?.createdBy?.type || appt?.channel || "").toString().toLowerCase();
   if (src.includes("admin") || src.includes("manual") || src.includes("staff")) return false;
-  return false; // default: don't count without explicit online proof
+  if (src.includes("online") || src.includes("web")) return true;
+  return false;
 }
 
 /* ============ /webhooks (IC from Framer) ============ */
@@ -229,7 +231,7 @@ app.post("/webhooks", async (req, res) => {
     if (user_data.fn) ud.fn = /^[a-f0-9]{64}$/.test(user_data.fn) ? user_data.fn : sha256(lower(user_data.fn));
     if (user_data.ln) ud.ln = /^[a-f0-9]{64}$/.test(user_data.ln) ? user_data.ln : sha256(lower(user_data.ln));
 
-    // Store IC info in cache for PII fallback / enrichment
+    // Cache IC for PII fallback / enrichment
     if (event_id) icSet(event_id, { fbp: ud.fbp, fbc: ud.fbc, em: ud.em, ph: ud.ph, fn: ud.fn, ln: ud.ln });
 
     const metaBody = {
@@ -240,7 +242,6 @@ app.post("/webhooks", async (req, res) => {
         action_source,
         event_id,
         user_data: ud,
-        // no custom_data here to avoid "fixed value/currency" warnings
       }],
       access_token: META_ACCESS_TOKEN,
     };
@@ -257,13 +258,11 @@ app.post("/webhooks", async (req, res) => {
 
 /* ============ Build Purchase payload ============ */
 function mapAppointmentToPurchase(appt, { user_data, event_id, test_event_code } = {}) {
-  // Prefer a meaningful source URL if present later; else fall back to your booking page
   const srcRef = extractReferrer(appt);
   const srcUrl =
     (srcRef && /^https?:\/\//i.test(srcRef) ? srcRef : null) ||
     EVENT_SOURCE_URL_BOOK;
 
-  // Multi-service contents (defaults preserved)
   const services = Array.isArray(appt?.services) ? appt.services : [];
   const contents = services.length
     ? services.map((s, idx) => ({
@@ -271,11 +270,7 @@ function mapAppointmentToPurchase(appt, { user_data, event_id, test_event_code }
         quantity: 1,
         item_price: Number(s?.price) || APPT_VALUE_NUM,
       }))
-    : [{
-        id: `service:${services?.[0]?.service?.name || "Appointment"}`,
-        quantity: 1,
-        item_price: APPT_VALUE_NUM,
-      }];
+    : [{ id: "service:Appointment", quantity: 1, item_price: APPT_VALUE_NUM }];
 
   const totalValue = contents.reduce((sum, c) => sum + (Number(c.item_price) || 0), 0) || APPT_VALUE_NUM;
   const currency = (appt?.currency || DEFAULT_CURRENCY || "CAD").toUpperCase();
@@ -285,7 +280,6 @@ function mapAppointmentToPurchase(appt, { user_data, event_id, test_event_code }
   const body = {
     data: [{
       event_name: "Purchase",
-      // IMPORTANT: use the booking creation time to improve attribution
       event_time: safeEventTime(appt?.createdAt || appt?.dateTime || Date.now()),
       action_source: "website",
       event_source_url: srcUrl,
@@ -298,8 +292,8 @@ function mapAppointmentToPurchase(appt, { user_data, event_id, test_event_code }
         contents,
         content_name: contentName,
         content_category: contentCategory,
-        order_id: String(appt?.id || ""),     // helps QA & dedup visibility
-        booking_time: appt?.dateTime || undefined, // for your own analysis
+        order_id: String(appt?.id || ""),
+        booking_time: appt?.dateTime || undefined,
       },
     }],
     access_token: META_ACCESS_TOKEN,
@@ -347,7 +341,7 @@ app.post("/webhooks/mangomint", async (req, res) => {
     // REQUIRED: online booking only
     if (!isOnlineBooking(appt)) return res.status(200).json({ ok: true, skipped: "manual_booking" });
 
-    // Extract eid directly if present (future-proof; MangoMint may add it later)
+    // Extract eid directly if present
     let eid = getEidFromAppointment(appt);
 
     // Build base user_data from MangoMint payload (hashed)
@@ -361,12 +355,11 @@ app.post("/webhooks/mangomint", async (req, res) => {
     if (cli.firstName) baseUD.fn = sha256(lower(cli.firstName));
     if (cli.lastName)  baseUD.ln = sha256(lower(cli.lastName));
 
-    // Add external_id if available (helps server-side matching)
-    // prefer clientInfo.id, else appointment.id
+    // ✅ Hash external_id (Meta best practice)
     const possibleExternal =
       (cli?.id ? String(cli.id) : null) ||
       (appt?.id ? String(appt.id) : null);
-    if (possibleExternal) baseUD.external_id = possibleExternal;
+    if (possibleExternal) baseUD.external_id = sha256(String(possibleExternal));
 
     // If no eid, try PII fallback to recent IC
     if (!eid) {
@@ -380,21 +373,21 @@ app.post("/webhooks/mangomint", async (req, res) => {
       }
     }
 
-    // Require eid or external_id (your chosen behavior)
+    // Require eid or external_id (hashed) to proceed
     if (!eid && !baseUD.external_id) {
       log("SKIP → no attribution (no eid and no external_id/PII match)");
       return res.status(200).json({ ok: true, skipped: "no_attribution" });
     }
 
-    // Use eid if present for event_id; otherwise use external_id (prefixed) to dedup
-    const event_id = eid || `external-${baseUD.external_id}`;
+    // ✅ Use eid if present; otherwise unique per-appointment fallback (prevents cross-booking dedup)
+    const event_id = eid || `appt-${String(appt?.id || Date.now())}`;
 
     if (alreadySent(event_id)) {
       log("Dedup: Purchase already sent for", event_id);
       return res.status(200).json({ ok: true, skipped: "duplicate_event" });
     }
 
-    // Enrich user_data with anything stored under eid (fbp/fbc, etc.) if eid exists
+    // Enrich user_data with cache when using eid
     const cached = eid ? icGet(event_id) : null;
     const user_data = { ...baseUD };
     if (cached?.fbp && !user_data.fbp) user_data.fbp = cached.fbp;
@@ -420,13 +413,11 @@ app.post("/webhooks/mangomint", async (req, res) => {
     return res.status(200).json({ ok: true, meta: j });
   } catch (err) {
     console.error("MangoMint webhook error:", err);
-    // 200 with ok:false keeps MangoMint from retry storms but indicates failure upstream
     return res.status(200).json({ ok: false, error: String(err) });
   }
 });
 
 /* ============ (Optional) /webhooks/sale — disabled for POS/terminal payments ============ */
-// Kept for completeness; intentionally not mapping terminal sales to Website Purchase to avoid double-counting.
 app.post("/webhooks/sale", async (req, res) => {
   log("HIT /webhooks/sale ip=", clientIp(req));
   try {

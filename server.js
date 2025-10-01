@@ -1,9 +1,9 @@
 // server.js — MangoMint ↔ Meta CAPI bridge (IC + Purchase) — v2
-// Changes from your version:
-// - Graph API bumped to v21.0
-// - access_token + test_event_code appended to URL query (required by Meta)
-// - CORS widened to include Framer preview domains (keep/adjust as you like)
-// - Extra logs and stricter JSON handling kept lightweight
+// - Graph v21.0
+// - access_token + test_event_code in URL query (Meta requirement)
+// - CORS allows your domain + Framer preview
+// ENV required: META_PIXEL_ID, META_ACCESS_TOKEN
+// Optional ENV: DEBUG_LOGS=1, DEFAULT_CURRENCY, DEFAULT_APPT_VALUE, EVENT_SOURCE_URL(_BOOK), MM_WEBHOOK_KEY
 
 import express from "express";
 import cors from "cors";
@@ -18,16 +18,14 @@ const ts = () => new Date().toISOString();
 const log = (...a) => { if (DEBUG) console.log(`[${ts()}]`, ...a); };
 
 /* ============ CORS ============ */
-// Allow your prod domain + Framer previews. Tighten if needed.
 const allowedOrigins = new Set([
   "https://altheatherapie.ca",
   "https://www.altheatherapie.ca",
 ]);
 app.use(cors({
   origin(origin, cb) {
-    if (!origin) return cb(null, true); // server-to-server / health
+    if (!origin) return cb(null, true);
     if (allowedOrigins.has(origin)) return cb(null, true);
-    // Allow Framer preview & share links (adjust if you know your exact preview origin)
     if (/^https:\/\/.*\.(framer\.app|framer\.website)$/.test(origin)) return cb(null, true);
     return cb(new Error("Not allowed by CORS: " + origin));
   },
@@ -59,7 +57,6 @@ if (!META_PIXEL_ID || !META_ACCESS_TOKEN) {
 const EVENT_SOURCE_URL_BOOK =
   ENV_EVENT_URL || ENV_EVENT_URL_BOOK || "https://altheatherapie.ca/en/book";
 
-// Use latest version
 const GRAPH_VER = "v21.0";
 const META_BASE = `https://graph.facebook.com/${GRAPH_VER}/${META_PIXEL_ID}/events`;
 const APPT_VALUE_NUM = Number(DEFAULT_APPT_VALUE) || 100;
@@ -93,7 +90,7 @@ const normPhone = (v) => {
   return x;
 };
 
-/* ============ Tiny retry to Meta (token in URL) ============ */
+/* ============ Meta POST with retries (token in URL) ============ */
 async function sendToMeta(body, test_event_code) {
   const qs = new URLSearchParams({ access_token: META_ACCESS_TOKEN });
   if (test_event_code) qs.set("test_event_code", String(test_event_code));
@@ -124,10 +121,9 @@ app.get("/webhooks", (_req, res) => res.status(200).send("POST /webhooks alive")
 app.get("/webhooks/mangomint", (_req, res) => res.status(200).send("POST /webhooks/mangomint alive"));
 app.get("/webhooks/sale", (_req, res) => res.status(200).send("POST /webhooks/sale alive"));
 
-/* ============ IC Cache (eid → attribution) ============ */
-const IC_CACHE = new Map(); // key: eid → { fbp,fbc,em,ph,fn,ln, ts }
+/* ============ IC Cache ============ */
+const IC_CACHE = new Map(); // event_id → { fbp,fbc,em,ph,fn,ln, ts }
 const IC_TTL_MS = 24 * 60 * 60 * 1000;
-
 function icSet(eid, data) { IC_CACHE.set(eid, { ...data, ts: Date.now() }); }
 function icGet(eid) {
   const v = IC_CACHE.get(eid);
@@ -296,7 +292,6 @@ function mapAppointmentToPurchase(appt, { user_data, event_id, test_event_code }
 app.post("/webhooks/mangomint", async (req, res) => {
   log("HIT /webhooks/mangomint ip=", clientIp(req));
   try {
-    // Optional secret: header OR query (?key=)
     if (WEBHOOK_SECRET) {
       const gotHeader = req.headers["x-webhook-secret"] || req.headers["X-Webhook-Secret"];
       const gotQuery = req.query.key || req.query.secret;
@@ -316,19 +311,15 @@ app.post("/webhooks/mangomint", async (req, res) => {
     const test_event_code = payload.test_event_code || req.query.test_event_code;
     if (!appt) return res.status(200).json({ ok: false, msg: "Ignored: no appointment" });
 
-    // Idempotency by appointment.id
     if (apptAlreadySent(appt?.id)) {
       log("Dedup: appointment already processed", appt?.id);
       return res.status(200).json({ ok: true, skipped: "duplicate_appointment" });
     }
 
-    // Online bookings only
     if (!isOnlineBooking(appt)) return res.status(200).json({ ok: true, skipped: "manual_booking" });
 
-    // Extract/derive eid
     let eid = getEidFromAppointment(appt);
 
-    // Build user_data (hashed)
     const ua = req.headers["user-agent"] || "unknown";
     const baseUD = { client_ip_address: clientIp(req), client_user_agent: ua };
     const cli = appt.clientInfo || appt.onlineBookingClientInfo || {};
@@ -338,11 +329,9 @@ app.post("/webhooks/mangomint", async (req, res) => {
     if (ph_h) baseUD.ph = ph_h;
     if (cli.firstName) baseUD.fn = sha256(lower(cli.firstName));
     if (cli.lastName)  baseUD.ln = sha256(lower(cli.lastName));
-    // external_id best practice
     const possibleExternal = (cli?.id ? String(cli.id) : null) || (appt?.id ? String(appt.id) : null);
     if (possibleExternal) baseUD.external_id = sha256(String(possibleExternal));
 
-    // If no eid, try to match recent IC by PII
     if (!eid) {
       const match = icFindByPII({ em: em_h, ph: ph_h });
       if (match) {
@@ -353,7 +342,6 @@ app.post("/webhooks/mangomint", async (req, res) => {
       }
     }
 
-    // Require eid or external_id
     if (!eid && !baseUD.external_id) {
       log("SKIP → no attribution (no eid and no external_id/PII match)");
       return res.status(200).json({ ok: true, skipped: "no_attribution" });
